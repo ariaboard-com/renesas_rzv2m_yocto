@@ -1,0 +1,112 @@
+--- ./arch/arm64/kernel/smp.c.bak	2020-12-22 15:52:43.491349219 +0900
++++ ./arch/arm64/kernel/smp.c	2020-12-22 15:59:40.000000000 +0900
+@@ -751,6 +751,13 @@
+ 	S(IPI_WAKEUP, "CPU wake-up interrupts"),
+ };
+ 
++struct ipi {
++	const char *desc;
++	void (*handler)(int ipinr);
++};
++
++static struct ipi ipi_handle_tbl[MAX_IPI - NR_IPI];
++
+ static void smp_cross_call(const struct cpumask *target, unsigned int ipinr)
+ {
+ 	trace_ipi_raise(target, ipi_types[ipinr]);
+@@ -769,6 +776,17 @@
+ 				   __get_irq_stat(cpu, ipi_irqs[i]));
+ 		seq_printf(p, "      %s\n", ipi_types[i]);
+ 	}
++
++	for (i = NR_IPI; i < MAX_IPI; i++) {
++		if (ipi_handle_tbl[i-NR_IPI].handler) {
++			seq_printf(p, "%*s%u:%s", prec - 1, "IPI", i,
++			    prec >= 4 ? " " : "");
++			for_each_online_cpu(cpu)
++				seq_printf(p, "%10u ",
++					__get_irq_stat(cpu, ipi_irqs[i]));
++			seq_printf(p, "      %s\n", ipi_handle_tbl[i-NR_IPI].desc);
++		}
++	}
+ }
+ 
+ u64 smp_irq_stat_cpu(unsigned int cpu)
+@@ -776,7 +794,7 @@
+ 	u64 sum = 0;
+ 	int i;
+ 
+-	for (i = 0; i < NR_IPI; i++)
++	for (i = 0; i < MAX_IPI; i++)
+ 		sum += __get_irq_stat(cpu, ipi_irqs[i]);
+ 
+ 	return sum;
+@@ -855,6 +873,8 @@
+ 
+ 	if ((unsigned)ipinr < NR_IPI) {
+ 		trace_ipi_entry_rcuidle(ipi_types[ipinr]);
++	}
++	if ((unsigned)ipinr < MAX_IPI) {
+ 		__inc_irq_stat(cpu, ipi_irqs[ipinr]);
+ 	}
+ 
+@@ -909,7 +929,14 @@
+ #endif
+ 
+ 	default:
+-		pr_crit("CPU%u: Unknown IPI message 0x%x\n", cpu, ipinr);
++		if (ipi_handle_tbl[ipinr-NR_IPI].handler) {
++			irq_enter();
++			ipi_handle_tbl[ipinr-NR_IPI].handler(ipinr);
++			irq_exit();
++		} else {
++			pr_crit("CPU%u: Unknown IPI message 0x%x\n",
++ 		        cpu, ipinr);
++		}
+ 		break;
+ 	}
+ 
+@@ -918,6 +945,43 @@
+ 	set_irq_regs(old_regs);
+ }
+ 
++/*
++ * set_ipi_handler:
++ * Interface provided for a kernel module to specify an IPI handler function.
++ */
++int set_ipi_handler(int ipinr, void *handler, char *desc)
++{
++	unsigned int cpu = raw_smp_processor_id();
++
++	if (ipinr < NR_IPI) {
++		pr_crit("CPU%u: IPI handler 0x%x cannot registered\n",
++					cpu, ipinr);
++		return -1;
++	}
++	if (ipi_handle_tbl[ipinr-NR_IPI].handler) {
++		pr_crit("CPU%u: IPI handler 0x%x already registered to %pf\n",
++					cpu, ipinr, ipi_handle_tbl[ipinr-NR_IPI].handler);
++		return -1;
++	}
++
++	ipi_handle_tbl[ipinr-NR_IPI].handler = handler;
++	ipi_handle_tbl[ipinr-NR_IPI].desc = desc;
++
++	return 0;
++}
++EXPORT_SYMBOL(set_ipi_handler);
++
++/*
++ * clear_ipi_handler:
++ * Interface provided for a kernel module to clear an IPI handler function.
++ */
++void clear_ipi_handler(int ipinr)
++{
++	ipi_handle_tbl[ipinr-NR_IPI].handler = NULL;
++	ipi_handle_tbl[ipinr-NR_IPI].desc = NULL;
++}
++EXPORT_SYMBOL(clear_ipi_handler);
++
+ void smp_send_reschedule(int cpu)
+ {
+ 	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);

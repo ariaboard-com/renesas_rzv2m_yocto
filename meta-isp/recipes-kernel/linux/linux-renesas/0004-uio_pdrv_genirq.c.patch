@@ -1,0 +1,76 @@
+--- ./drivers/uio/uio_pdrv_genirq.c.org	2020-11-26 22:36:58.735285123 +0900
++++ ./drivers/uio/uio_pdrv_genirq.c	2020-11-26 22:42:03.000000000 +0900
+@@ -30,11 +30,15 @@
+ 
+ #define DRIVER_NAME "uio_pdrv_genirq"
+ 
++extern int set_ipi_handler(int ipinr, void *handler, char *desc);
++extern void clear_ipi_handler(int ipinr);
++
+ struct uio_pdrv_genirq_platdata {
+ 	struct uio_info *uioinfo;
+ 	spinlock_t lock;
+ 	unsigned long flags;
+ 	struct platform_device *pdev;
++	unsigned int ipino;
+ };
+ 
+ /* Bits in uio_pdrv_genirq_platdata.flags */
+@@ -76,6 +80,13 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++static struct uio_info* ipi_uio_info[16];
++
++static void ipi_handler(int ipinr)
++{
++	uio_event_notify(ipi_uio_info[ipinr]);
++}
++
+ static int uio_pdrv_genirq_irqcontrol(struct uio_info *dev_info, s32 irq_on)
+ {
+ 	struct uio_pdrv_genirq_platdata *priv = dev_info->priv;
+@@ -88,7 +99,9 @@
+ 	 * Serialize this operation to support multiple tasks and concurrency
+ 	 * with irq handler on SMP systems.
+ 	 */
+-
++	if (dev_info->irq == UIO_IRQ_CUSTOM)
++		return 0;
++
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 	if (irq_on) {
+ 		if (__test_and_clear_bit(UIO_IRQ_DISABLED, &priv->flags))
+@@ -107,6 +120,7 @@
+ 	struct uio_info *uioinfo = dev_get_platdata(&pdev->dev);
+ 	struct uio_pdrv_genirq_platdata *priv;
+ 	struct uio_mem *uiomem;
++	const void *of_prop;
+ 	int ret = -EINVAL;
+ 	int i;
+ 
+@@ -154,6 +168,14 @@
+ 			dev_err(&pdev->dev, "failed to get IRQ\n");
+ 			return ret;
+ 		}
++
++		of_prop = of_get_property(pdev->dev.of_node, "ipi", NULL);
++		if (of_prop) {
++			uioinfo->irq = UIO_IRQ_CUSTOM;
++			priv->ipino = be32_to_cpup(of_prop);
++			ipi_uio_info[priv->ipino] = priv->uioinfo;
++			set_ipi_handler(priv->ipino, ipi_handler, "Kick From uC3");
++		}
+ 	}
+ 
+ 	uiomem = &uioinfo->mem[0];
+@@ -223,6 +245,9 @@
+ 	uio_unregister_device(priv->uioinfo);
+ 	pm_runtime_disable(&pdev->dev);
+ 
++	if (priv->ipino) {
++		clear_ipi_handler(priv->ipino);
++	}
+ 	priv->uioinfo->handler = NULL;
+ 	priv->uioinfo->irqcontrol = NULL;
+ 

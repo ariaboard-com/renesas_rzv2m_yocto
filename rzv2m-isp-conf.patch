@@ -1,0 +1,29 @@
+diff --git a/build/conf/bblayers.conf b/build/conf/bblayers.conf
+index 3633e89..25b521b 100755
+--- a/build/conf/bblayers.conf
++++ b/build/conf/bblayers.conf
+@@ -22,4 +22,6 @@ BBLAYERS ?= " \
+   ${@'${TOPDIR}/../meta-openembedded/meta-python' if '${VIRTUALIZATION_CHECK}' == 'True' else ''} \
+   ${@'${TOPDIR}/../meta-virtualization' if '${VIRTUALIZATION_CHECK}' == 'True' else ''} \
+   ${TOPDIR}/../meta-drpai \
++  ${TOPDIR}/../meta-openamp \
++  ${TOPDIR}/../meta-isp \
+   "
+diff --git a/build/conf/local.conf b/build/conf/local.conf
+index 0ecfd2f..9eaba0d 100755
+--- a/build/conf/local.conf
++++ b/build/conf/local.conf
+@@ -369,3 +369,13 @@ BB_NO_NETWORK = "0"
+ TOOLCHAIN_TARGET_TASK_append = " kernel-devsrc"
+ 
+ IMAGE_INSTALL_append =" ai-eva-sw "
++
++PREFERRED_VERSION_libmetal="2018.10%"
++PREFERRED_VERSION_open-amp="2018.10%"
++# OpenAMP settings
++IMAGE_INSTALL_append = " \
++    kernel-modules \
++    libmetal \
++    open-amp \
++"
++IMAGE_INSTALL_append =" comctl "

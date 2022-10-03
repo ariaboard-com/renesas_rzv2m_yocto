@@ -1,0 +1,3652 @@
+diff --git a/arch/arm64/boot/dts/renesas/r9a09g011gbg-evaluation-board.dts b/arch/arm64/boot/dts/renesas/r9a09g011gbg-evaluation-board.dts
+index fe77b1e..fcd10f4 100755
+--- a/arch/arm64/boot/dts/renesas/r9a09g011gbg-evaluation-board.dts
++++ b/arch/arm64/boot/dts/renesas/r9a09g011gbg-evaluation-board.dts
+@@ -277,3 +277,8 @@
+     status = "okay";
+ };
+ 
++&drpai0 {
++    memory-region = <&drp_reserved>;
++    linux-memory-region = < &{/memory@180000000} >; 
++    status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/renesas/r9a09g011gbg.dtsi b/arch/arm64/boot/dts/renesas/r9a09g011gbg.dtsi
+index 0c5583b..4968b11 100755
+--- a/arch/arm64/boot/dts/renesas/r9a09g011gbg.dtsi
++++ b/arch/arm64/boot/dts/renesas/r9a09g011gbg.dtsi
+@@ -972,5 +972,16 @@
+             #pwm-cells = <2>;
+             status = "disabled";
+         };
++
++        drpai0: drpai@83000000 {
++            compatible = "renesas,rzv2m-drpai";
++            reg = <0 0x83000000 0 0x1000000>,
++                 <0 0x84000000 0 0x400000>;
++            interrupts = <GIC_SPI 345 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SPI 346 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SPI 347 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SPI 348 IRQ_TYPE_LEVEL_HIGH>;
++            status = "disabled";
++        };
+     };
+ };
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 9b71d8f..032aade 100755
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -223,4 +223,6 @@ source "drivers/udmabuf/Kconfig"
+ 
+ source "drivers/hw_tim/Kconfig"
+ 
++source "drivers/drpai/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 8229f4c..6e7fb48 100755
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -188,3 +188,4 @@ obj-$(CONFIG_SIOX)		+= siox/
+ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_U_DMA_BUF)        += udmabuf/
+ obj-$(CONFIG_TIM_RZV2M)        += hw_tim/
++obj-$(CONFIG_DRPAI)		+= drpai/
+diff --git b/drivers/drpai/Kconfig b/drivers/drpai/Kconfig
+new file mode 100755
+index 0000000..e626673
+--- /dev/null
++++ b/drivers/drpai/Kconfig
+@@ -0,0 +1,14 @@
++#
++# DRP-AI subsystem configuration
++#
++
++menu "DRP-AI support"
++
++config DRPAI
++	tristate "DRP-AI support"
++	default y
++	help
++	  DRP-AI is a peripheral hardware that accelerates AI.
++	  If you want DRP-AI support, you should say Y here.
++
++endmenu
+diff --git b/drivers/drpai/Makefile b/drivers/drpai/Makefile
+new file mode 100755
+index 0000000..86915ad
+--- /dev/null
++++ b/drivers/drpai/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for DRP-AI.
++#
++
++obj-$(CONFIG_DRPAI)	+= drpai-core.o drpai-if.o
++
+diff --git b/drivers/drpai/drpai-core.c b/drivers/drpai/drpai-core.c
+new file mode 100755
+index 0000000..90be00e
+--- /dev/null
++++ b/drivers/drpai/drpai-core.c
+@@ -0,0 +1,1167 @@
++/*
++ * Driver for the Renesas RZ/V2M DRP-AI unit
++ *
++ * Copyright (C) 2021 Renesas Electronics Corporation
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#include <linux/module.h>
++#include <asm/io.h>
++#include <linux/delay.h>
++#else
++#include "r_typedefs.h"
++#endif
++#include <linux/drpai.h>
++#include "drpai-core.h"
++#include "drpai-reg.h"
++
++#define DRP_ERRINT_MSK_REG_NUM              (6)
++#define DRP_ERRINT_STATUS_REG_NUM           (6)
++#define AIMAC_ERRINT_MSK_REG_NUM            (34)
++#define AIMAC_ERRINT_STATUS_REG_NUM         (35)
++#define SET_STPC_CLKGEN_CTRL                (0x00000001)
++#define SET_STPC_CLKGEN_RST                 (0x00000000)
++#define SET_STPC_CLKGEN_STBYWAIT_EN         (0x00000001)
++#define SET_STPC_CLKGEN_STBYWAIT_DI         (0x00000000)
++#define SET_STPC_CLKGEN_DIV                 (0x00030001)
++#define SET_STPC_CLKE_EN                    (0x100F030F)
++#define SET_STPC_CLKE_DI                    (0x00000000)
++#define SET_STPC_SFTRST_EN                  (0xFFFFFFFF)
++#define SET_STPC_SFTRST_DI                  (0x21F000F0)
++#define SET_DSCC_DCTL_CR                    (0x00000000)
++#define SET_DSCC_DCTL                       (0x00310001)
++#define SET_EXD0_STPC_CLKGEN_CTRL           (0x00000001)
++#define SET_EXD0_STPC_CLKGEN_RST            (0x00000000)
++#define SET_EXD0_STPC_CLKGEN_STBYWAI_EN     (0x00000001)
++#define SET_EXD0_STPC_CLKGEN_STBYWAI_DI     (0x00000000)
++#define SET_EXD0_STPC_CLKGEN_DIV            (0x00010000)
++#define SET_EXDX_STPC_CLKE_EN               (0x100F000F)
++#define SET_EXDX_STPC_CLKE_DI               (0x00000000)
++#define SET_CLKRSTCON_CLKE_EN               (0x00000001)
++#define SET_CLKRSTCON_CLKE_DI               (0x00000000)
++#define SET_EXDX_STPC_SFTRST_EN             (0xB1FF03FF)
++#define SET_EXDX_STPC_SFTRST_DI             (0xA1F003F0)
++#define SET_CLKRSTCON_SFTRST_EN             (0x0000001F)
++#define SET_CLKRSTCON_SFTRST_DI             (0x00000000)
++#define SET_EXD1_ODIF_INTMSK                (0x0300FFF7)
++#define SET_AID_DSCC_DCTL_CR                (0x00000000)
++#define SET_AID_DSCC_DCTL                   (0x00000001)
++#define SET_SYNCTBL_TBLX                    (0x0000FFFF)
++#define SET_IDMACIF_DSC_EN                  (0x00040001)
++#define SET_IDMACIF_MEMR_EN                 (0x00040101)
++#define SET_DSCC_DMA_EN                     (0x00000001)
++#define SET_DSCC_DMA_DI                     (0x00000000)
++#define DRPAI_RESERVED_DSCC_PAMON           (0)
++#define DRPAI_RESERVED_AID_DSCC_PAMON       (1)
++#define DRPAI_RESERVED_STPC_ERRINT_STS      (2)
++#define DRPAI_RESERVED_INTMON_ERRINT        (3)
++#define DRPAI_RESERVED_EXD1_ODIF_INT_IRQ    (4)
++#define DRPAI_RESERVED_EXD1_ODIF_INT_NOW    (5)
++#define DRPAI_RESERVED_SYNCTBL_TBL12        (6)
++#define DRPAI_RESERVED_SYNCTBL_TBL13        (7)
++#define DRPAI_RESERVED_SYNCTBL_TBL14        (8)
++#define DRPAI_RESERVED_SYNCTBL_TBL15        (9)
++
++/* Base address */
++extern void __iomem *g_drp_base_addr[DRP_CH_NUM];
++extern void __iomem *g_aimac_base_address[AIMAC_CH_NUM];
++extern struct drpai_priv *drpai_priv;
++
++static int32_t drp_init(int32_t ch);
++static int32_t drp_start(int32_t ch, uint32_t desc);
++static int32_t aimac_init(int32_t ch);
++static int32_t aimac_start(int32_t ch, uint32_t desc);
++static void reg_bit_clear(volatile void __iomem *reg_address, uint32_t bit);
++static void aimac_clear_synctbl_tbl(int32_t ch);
++static int8_t check_dma_reg_stop(void __iomem *base, uint32_t offset);
++static int8_t check_dma_stop(void __iomem *base, uint32_t *offset, uint32_t num_offset);
++static int8_t wait_for_dma_stop(void __iomem *base, uint32_t *offset, uint32_t num_offset);
++static int8_t wait_for_desc_prefetch_stop(void __iomem *base, uint32_t offset);
++
++static uint32_t exd0_odif_int_val;
++static uint32_t stpc_errint_sts_val;
++static uint32_t intmon_errint_val;
++
++/* DRP ERRINT */
++const static uint32_t drp_errint_msk_reg_tbl[DRP_ERRINT_MSK_REG_NUM][2] =
++{
++    {IDIF_EINTMSK       ,0x00F0F0F0}, {IDIF_EINTMSK_DSC ,0x00000000},
++    {ODIF_EINTMSK       ,0x07F0F0F0}, {IDMAC_INTME      ,0x55550000},
++    {ODMAC_INTME        ,0x5555FF80}, {RAC_EINTM        ,0x00000000},
++};
++const static uint32_t drp_errint_status_reg_tbl[DRP_ERRINT_STATUS_REG_NUM] =
++{
++    IDIF_EINT, IDIF_EINT_DSC, ODIF_EINT, IDMAC_INTSE,
++    ODMAC_INTSE, RAC_EINTS
++};
++const static char* drp_errint_status_reg_name_tbl[DRP_ERRINT_STATUS_REG_NUM] =
++{
++    "IDIF_EINT","IDIF_EINT_DSC","ODIF_EINT","IDMAC_INTSE",
++    "ODMAC_INTSE","RAC_EINTS"
++};
++/* AI-MAC ERRINT */
++const static uint32_t aimac_errint_msk_reg_tbl[AIMAC_ERRINT_MSK_REG_NUM][2] =
++{
++    {AID_IDIF_EINTMSK   ,0x07FEFEFE}, {AID_IDMAC_INTME      ,0x55550000},
++    {AIMRAC_EINTM       ,0x00000000}, {CMDSEL_ERRMSK        ,0x00000000},
++    {PRAM_INTMASK       ,0x00000000}, {OSEL_DO_MSK0         ,0x00000000},
++    {OSEL_DO_MSK1       ,0x00000000}, {OSEL_DO_MSK2         ,0x00000000},
++    {OSEL_DO_MSK3       ,0x00000000}, {OSEL_DO_MSK4         ,0x00000000},
++    {OSEL_DO_MSK5       ,0x00000000}, {OSEL_DO_MSK6         ,0x00000000},
++    {OSEL_DO_MSK7       ,0x00000000}, {OSEL_DO_MSK8         ,0x00000000},
++    {OSEL_DO_EN0        ,0x00000001}, {OSEL_DO_EN1          ,0x00000001},
++    {OSEL_DO_EN2        ,0x00000001}, {OSEL_DO_EN3          ,0x00000001},
++    {OSEL_DO_EN4        ,0x00000001}, {OSEL_DO_EN5          ,0x00000001},
++    {OSEL_DO_EN6        ,0x00000001}, {OSEL_DO_EN7          ,0x00000001},
++    {OSEL_DO_EN8        ,0x00000001}, {MACTOP_ERR_MSK       ,0x00000000},
++    {EXD0_IDIF_EINTMSK  ,0x07F0F0F0}, {EXD1_IDIF_EINTMSK    ,0x07F0F0F0},
++    {EXD0_ODIF_EINTMSK  ,0x07F0F0F0}, {EXD1_ODIF_EINTMSK    ,0x07F0F0F0},
++    {EXD0_IDMAC_INTME   ,0x55550000}, {EXD1_IDMAC_INTME     ,0x55550000},
++    {EXD0_ODMAC_INTME   ,0x55550000}, {EXD1_ODMAC_INTME     ,0x55550000},
++    {EXD0_RAC_EINTM     ,0x00000000}, {EXD1_RAC_EINTM       ,0x00000000},
++};
++const static uint32_t aimac_errint_status_reg_tbl[AIMAC_ERRINT_STATUS_REG_NUM] =
++{
++    AID_IDIF_EINT,AID_IDMAC_INTSE,AIMRAC_EINTS,CMDSEL_ERRSTS,PRAM_INT,
++    OSEL_DO_ESTS0,OSEL_DO_ESTS1,OSEL_DO_ESTS2,OSEL_DO_ESTS3,OSEL_DO_ESTS4,
++    OSEL_DO_ESTS5,OSEL_DO_ESTS6,OSEL_DO_ESTS7,OSEL_DO_ESTS8,OSEL_DO_FESTS0,
++    OSEL_DO_FESTS1,OSEL_DO_FESTS2,OSEL_DO_FESTS3,OSEL_DO_FESTS4,OSEL_DO_FESTS5,
++    OSEL_DO_FESTS6,OSEL_DO_FESTS7,OSEL_DO_FESTS8,MACTOP_ERR_STS,MACCTL_FERR_STS,
++    EXD0_IDIF_EINT,EXD1_IDIF_EINT,EXD0_ODIF_EINT,EXD1_ODIF_EINT,EXD0_IDMAC_INTSE,
++    EXD1_IDMAC_INTSE,EXD0_ODMAC_INTSE,EXD1_ODMAC_INTSE,EXD0_RAC_EINTS,EXD1_RAC_EINTS
++};
++const static char* aimac_errint_status_reg_name_tbl[AIMAC_ERRINT_STATUS_REG_NUM] =
++{
++    "AID_IDIF_EINT","AID_IDMAC_INTSE","AIMRAC_EINTS","CMDSEL_ERRSTS","PRAM_INT",
++    "OSEL_DO_ESTS0","OSEL_DO_ESTS1","OSEL_DO_ESTS2","OSEL_DO_ESTS3","OSEL_DO_ESTS4",
++    "OSEL_DO_ESTS5","OSEL_DO_ESTS6","OSEL_DO_ESTS7","OSEL_DO_ESTS8","OSEL_DO_FESTS0",
++    "OSEL_DO_FESTS1","OSEL_DO_FESTS2","OSEL_DO_FESTS3","OSEL_DO_FESTS4","OSEL_DO_FESTS5",
++    "OSEL_DO_FESTS6","OSEL_DO_FESTS7","OSEL_DO_FESTS8","MACTOP_ERR_STS","MACCTL_FERR_STS",
++    "EXD0_IDIF_EINT","EXD1_IDIF_EINT","EXD0_ODIF_EINT","EXD1_ODIF_EINT","EXD0_IDMAC_INTSE",
++    "EXD1_IDMAC_INTSE","EXD0_ODMAC_INTSE","EXD1_ODMAC_INTSE","EXD0_RAC_EINTS","EXD1_RAC_EINTS"
++};
++
++static int32_t drp_init(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    uint32_t loop;
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Enable DRP clock */
++    iowrite32(SET_STPC_CLKGEN_CTRL, g_drp_base_addr[ch] + STPC_CLKGEN_CTRL);
++
++    /* Unreset the DRPCLKGEN module */
++    iowrite32(SET_STPC_CLKGEN_RST, g_drp_base_addr[ch] + STPC_CLKGEN_RST);
++
++    /* Shift to standby mode */
++    iowrite32(SET_STPC_CLKGEN_STBYWAIT_EN, g_drp_base_addr[ch] + STPC_CLKGEN_STBYWAIT);
++
++    /* DRP clock operating frequency setting */
++    /* Div divided by 4 (DCLK=315MHz), set to dynamic frequency mode */
++    /* Div divided by 4 (DCLK=315MHz) -> When Config is loaded       */
++    /* Dynamic frequency mode -> When DRP application is running     */
++    iowrite32(SET_STPC_CLKGEN_DIV, g_drp_base_addr[ch] + STPC_CLKGEN_DIV);
++    iowrite32(SET_STPC_CLKGEN_STBYWAIT_DI, g_drp_base_addr[ch] + STPC_CLKGEN_STBYWAIT);
++
++    /* Enable DMA channel clock */
++    iowrite32(SET_STPC_CLKE_EN, g_drp_base_addr[ch] + STPC_CLKE);
++
++    /* Release Soft reset */
++    spin_lock_irqsave(&priv->lock, flags);
++    iowrite32(SET_STPC_SFTRST_DI, g_drp_base_addr[ch] + STPC_SFTRST);
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    /* Data input channel settings */
++    iowrite32(SET_IDMACIF_DSC_EN, g_drp_base_addr[ch] + IDIF_DMACTLI0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + IDIF_DMACTLI1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + IDIF_DMACTLI2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + IDIF_DMACTLI3);
++
++    /* Data output channel settings */
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + ODIF_DMACTLO0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + ODIF_DMACTLO1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + ODIF_DMACTLO2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_drp_base_addr[ch] + ODIF_DMACTLO3);
++
++    /* Configuration light */
++    iowrite32(SET_IDMACIF_DSC_EN, g_drp_base_addr[ch] + IDIF_DMACTLCW);
++
++    /* DRP error interrupt mask release */
++    for (loop = 0; loop < DRP_ERRINT_MSK_REG_NUM; loop++)
++    {
++        iowrite32(drp_errint_msk_reg_tbl[loop][1],
++               g_drp_base_addr[ch] + drp_errint_msk_reg_tbl[loop][0]);
++    }
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static int32_t drp_start(int32_t ch, uint32_t desc)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Set descriptor start address */
++    iowrite32(desc, g_drp_base_addr[ch] + DSCC_DPA);
++
++    /* Clear prefetch of input descriptor */
++    iowrite32(SET_DSCC_DCTL_CR, g_drp_base_addr[ch] + DSCC_DCTL);
++
++    /* Start prefetch of input descriptor */
++    iowrite32(SET_DSCC_DCTL, g_drp_base_addr[ch] + DSCC_DCTL);
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static int32_t aimac_init(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    uint32_t loop;
++
++    if (AIMAC_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Unreset MCLKGEN module */
++    iowrite32(SET_EXD0_STPC_CLKGEN_RST, g_aimac_base_address[ch] + EXD0_STPC_CLKGEN_RST);
++
++    /* Shift to standby mode */
++    iowrite32(SET_EXD0_STPC_CLKGEN_STBYWAI_EN, g_aimac_base_address[ch] + EXD0_STPC_CLKGEN_STBYWAIT);
++
++    /* AIMAC clock operating frequency setting */
++    /* Div divided by 2 (MCLK=630MHz), set to fixed frequency mode */
++    iowrite32(SET_EXD0_STPC_CLKGEN_DIV, g_aimac_base_address[ch] + EXD0_STPC_CLKGEN_DIV);
++
++    /* Clock activation */
++    iowrite32(SET_EXD0_STPC_CLKGEN_STBYWAI_DI, g_aimac_base_address[ch] + EXD0_STPC_CLKGEN_STBYWAIT);
++
++    /* Enable Clock */
++    iowrite32(SET_EXDX_STPC_CLKE_EN, g_aimac_base_address[ch] + EXD0_STPC_CLKE);
++    iowrite32(SET_EXDX_STPC_CLKE_EN, g_aimac_base_address[ch] + EXD1_STPC_CLKE);
++    iowrite32(SET_CLKRSTCON_CLKE_EN, g_aimac_base_address[ch] + CLKRSTCON_CLKE);
++
++    /* Release soft reset */
++    iowrite32(SET_EXDX_STPC_SFTRST_DI, g_aimac_base_address[ch] + EXD0_STPC_SFTRST);
++    iowrite32(SET_EXDX_STPC_SFTRST_DI, g_aimac_base_address[ch] + EXD1_STPC_SFTRST);
++    iowrite32(SET_CLKRSTCON_SFTRST_DI, g_aimac_base_address[ch] + CLKRSTCON_SFTRST);
++
++    /* DMA channel settings */
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI3);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO3);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI3);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO0);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO1);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO2);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO3);
++    iowrite32(SET_IDMACIF_MEMR_EN, g_aimac_base_address[ch] + AID_IDIF_DMACTLI0);
++
++    /* DRP-AI processing completion interrupt mask release */
++    iowrite32(SET_EXD1_ODIF_INTMSK, g_aimac_base_address[ch] + EXD1_ODIF_INTMSK);
++
++    /* AI-MAC error interrupt mask release */
++    for (loop = 0; loop < AIMAC_ERRINT_MSK_REG_NUM; loop++)
++    {
++        iowrite32(aimac_errint_msk_reg_tbl[loop][1],
++               g_aimac_base_address[ch] + aimac_errint_msk_reg_tbl[loop][0]);
++    }
++
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static int32_t aimac_start(int32_t ch, uint32_t desc)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    if (AIMAC_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Initialization of register value storage variable */
++    spin_lock_irqsave(&priv->lock, flags);
++    exd0_odif_int_val = 0;
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    /* Set the start address of AIMAC descriptor */
++    iowrite32(desc, g_aimac_base_address[ch] + AID_DSCC_DPA);
++
++    /* Start descriptor read */
++    iowrite32(SET_AID_DSCC_DCTL_CR, g_aimac_base_address[ch] + AID_DSCC_DCTL);
++    iowrite32(SET_AID_DSCC_DCTL, g_aimac_base_address[ch] + AID_DSCC_DCTL);
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_DRP_Open(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    ret = drp_init(ch);
++    if (R_DRPAI_SUCCESS != ret)
++    {
++        return ret;
++    }
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_DRP_Start(int32_t ch, uint32_t desc)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    ret = drp_start(ch, desc);
++    if (R_DRPAI_SUCCESS != ret)
++    {
++        return ret;
++    }
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_DRP_Errint(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    uint32_t reg_val;
++    uint32_t loop;
++
++    printk(KERN_ERR "DRP-AI DRP ERROR\n");
++
++    /* Show descriptor pointer */
++    reg_val = ioread32(g_drp_base_addr[ch] + DSCC_PAMON);
++    printk(KERN_ERR "DSCC_PAMON      : 0x%08X\n", reg_val);
++    reg_val = ioread32(g_aimac_base_address[ch] + AID_DSCC_PAMON);
++    printk(KERN_ERR "AID_DSCC_PAMON  : 0x%08X\n", reg_val);
++
++    /* Error interrupt cause register */
++    stpc_errint_sts_val = ioread32(g_drp_base_addr[ch] + STPC_ERRINT_STS);
++    printk(KERN_ERR "STPC_ERRINT_STS : 0x%08X\n", stpc_errint_sts_val);
++
++    /* Error display of each module */
++    reg_val = ioread32(g_drp_base_addr[ch] + DRP_ERRINTSTATUS);
++    printk(KERN_ERR "DRP_ERRINTSTATUS : 0x%08X\n", reg_val);
++    if (0 != reg_val)
++    {
++        reg_val = ioread32(g_drp_base_addr[ch] + STPC_SFTRST);
++        reg_val |= DRPAI_BIT31;
++        iowrite32(reg_val, g_drp_base_addr[ch] + STPC_SFTRST);
++    }
++    for (loop = 0; loop < DRP_ERRINT_STATUS_REG_NUM; loop++)
++    {
++        reg_val = ioread32(g_drp_base_addr[ch] + drp_errint_status_reg_tbl[loop]);
++        iowrite32(reg_val, g_drp_base_addr[ch] + drp_errint_status_reg_tbl[loop]);
++        printk(KERN_ERR "%s : 0x%08X\n", drp_errint_status_reg_name_tbl[loop], reg_val);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++int32_t R_DRPAI_AIMAC_Open(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (AIMAC_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    ret = aimac_init(ch);
++    if (R_DRPAI_SUCCESS != ret)
++    {
++        return ret;
++    }
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_AIMAC_Start(int32_t ch, uint32_t desc)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (AIMAC_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    ret = aimac_start(ch, desc);
++    if (R_DRPAI_SUCCESS != ret)
++    {
++        return ret;
++    }
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_AIMAC_Nmlint(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    volatile uint32_t dummy;
++
++    /* Debug information */
++    exd0_odif_int_val = ioread32(g_aimac_base_address[ch] + EXD1_ODIF_INT);
++
++    /* Clear interrupt factor */
++    iowrite32(0x00000008, g_aimac_base_address[ch] + EXD1_ODIF_INT);   /* Clear */
++    dummy = ioread32(g_aimac_base_address[ch] + EXD1_ODIF_INT);        /* Dummy read */
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++int32_t R_DRPAI_AIMAC_Errint(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    uint32_t reg_val;
++    uint8_t i;
++
++    printk(KERN_ERR "DRP-AI AI-MAC ERROR\n");
++
++    /* Show descriptor pointer */
++    reg_val = ioread32(g_drp_base_addr[ch] + DSCC_PAMON);
++    printk(KERN_ERR "DSCC_PAMON      : 0x%08X\n", reg_val);
++    reg_val = ioread32(g_aimac_base_address[ch] + AID_DSCC_PAMON);
++    printk(KERN_ERR "AID_DSCC_PAMON  : 0x%08X\n", reg_val);
++
++    /* Error interrupt cause register */
++    intmon_errint_val = ioread32(g_aimac_base_address[ch] + INTMON_ERRINT);
++    printk(KERN_ERR "INTMON_ERRINT : 0x%08X\n", intmon_errint_val);
++
++    for (i = 0; i < AIMAC_ERRINT_STATUS_REG_NUM; i++)
++    {
++        reg_val = ioread32(g_aimac_base_address[ch] + aimac_errint_status_reg_tbl[i]);
++        iowrite32(reg_val, g_aimac_base_address[ch] + aimac_errint_status_reg_tbl[i]);
++        printk(KERN_ERR "%s : 0x%08X\n",aimac_errint_status_reg_name_tbl[i], reg_val);
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++    return 0;
++}
++
++int32_t R_DRPAI_Status(int32_t ch, drpai_status_t *drpai_status)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++    if (AIMAC_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* DRP Address of descriptor */
++    drpai_status->reserved[DRPAI_RESERVED_DSCC_PAMON] = ioread32(g_drp_base_addr[ch] + DSCC_PAMON);
++
++    /* AI-MAC Address of descriptor */
++    drpai_status->reserved[DRPAI_RESERVED_AID_DSCC_PAMON] = ioread32(g_aimac_base_address[ch] + AID_DSCC_PAMON);
++
++    /* DRP-AI processing complete interrupt status */
++    drpai_status->reserved[DRPAI_RESERVED_EXD1_ODIF_INT_IRQ] = exd0_odif_int_val;
++    drpai_status->reserved[DRPAI_RESERVED_EXD1_ODIF_INT_NOW] = ioread32(g_aimac_base_address[ch] + EXD1_ODIF_INT);
++
++    /* AI-MAC synchronization information */
++    drpai_status->reserved[DRPAI_RESERVED_SYNCTBL_TBL12] = ioread32(g_aimac_base_address[ch] + SYNCTBL_TBL12);
++    drpai_status->reserved[DRPAI_RESERVED_SYNCTBL_TBL13] = ioread32(g_aimac_base_address[ch] + SYNCTBL_TBL13);
++    drpai_status->reserved[DRPAI_RESERVED_SYNCTBL_TBL14] = ioread32(g_aimac_base_address[ch] + SYNCTBL_TBL14);
++    drpai_status->reserved[DRPAI_RESERVED_SYNCTBL_TBL15] = ioread32(g_aimac_base_address[ch] + SYNCTBL_TBL15);
++
++    /* DRP error information */
++    drpai_status->reserved[DRPAI_RESERVED_STPC_ERRINT_STS] = stpc_errint_sts_val;
++
++    /* AI-MAC error information */
++    drpai_status->reserved[DRPAI_RESERVED_INTMON_ERRINT] = intmon_errint_val;
++
++    ret = R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static void reg_bit_clear(volatile void __iomem *reg_address, uint32_t bit)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    uint32_t tmp_reg;
++
++    /* Read register value */
++    tmp_reg = ioread32(reg_address);
++    /* Clear the target bit */
++    tmp_reg = tmp_reg & (~bit);
++
++    iowrite32(tmp_reg, reg_address);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++}
++
++static void aimac_clear_synctbl_tbl(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL0);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL1);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL2);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL3);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL4);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL5);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL6);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL7);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL8);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL9);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL10);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL11);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL12);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL13);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL14);
++    iowrite32(0x0000FFFF, g_aimac_base_address[ch] + SYNCTBL_TBL15);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++}
++
++static int8_t check_dma_reg_stop(void __iomem *base, uint32_t offset)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    uint32_t reg_val;
++    int8_t ret;
++
++    reg_val = ioread32(base + offset);
++    if(!((0 == (reg_val & DRPAI_BIT1)) || (DRPAI_BIT19 == (reg_val & DRPAI_BIT19))))
++    {
++        ret = -1;
++    }
++    else
++    {
++        ret = 0;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++    return ret;
++}
++
++static int8_t check_dma_stop(void __iomem *base, uint32_t *offset, uint32_t num_offset)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t i;
++    int32_t ret;
++
++    for(i = 0; i < num_offset; i++)
++    {
++        if(0 != check_dma_reg_stop(base, offset[i]))
++        {
++            goto not_stop;
++        }
++        else
++        {
++            ; // Do nothing
++        }
++    }
++
++    ret = 0;
++    goto end;
++not_stop:
++    ret = -1;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static int8_t wait_for_dma_stop(void __iomem *base, uint32_t *offset, uint32_t num_offset)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    bool is_stop = false;
++    int8_t ret;
++    int32_t i;
++
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        udelay(1);
++        i++;
++        if(0 != check_dma_stop(base, offset, num_offset))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        usleep_range(100, 200);
++        i++;
++        if(0 != check_dma_stop(base, offset, num_offset))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    if(true == is_stop)
++    {
++        ret = 0;
++    }
++    else
++    {
++        ret = -1;
++#ifdef  DRPAI_DRV_DEBUG
++        uint32_t reg_val;
++        for(i = 0; i < num_offset; i++) {
++            reg_val = ioread32(base + offset[i]);
++            DRPAI_DEBUG_PRINT(KERN_INFO "%s: offset: %08X = 0x%08X\n", __func__, offset[i], reg_val);
++        }
++#endif
++    }
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++static int8_t wait_for_desc_prefetch_stop(void __iomem *base, uint32_t offset)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    bool is_stop = false;
++    int8_t ret;
++    int32_t i;
++    uint32_t reg_val;
++
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        udelay(1);
++        i++;
++        reg_val = ioread32(base + offset);
++        if(0 != (reg_val & DRPAI_BIT1))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        usleep_range(100, 200);
++        i++;
++        reg_val = ioread32(base + offset);
++        if(0 != (reg_val & DRPAI_BIT1))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    if(true == is_stop)
++    {
++        ret = 0;
++    }
++    else
++    {
++        ret = -1;
++        DRPAI_DEBUG_PRINT(KERN_INFO "%s: offset: %08X = 0x%08X\n", __func__, offset, reg_val);
++    }
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_DRP_Reset(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    uint32_t offset_buf[4];
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Descriptor prefetch stop */
++    reg_bit_clear(g_drp_base_addr[ch] + DSCC_DCTL, DRPAI_BIT0);
++    if(0 != wait_for_desc_prefetch_stop(g_drp_base_addr[ch], DSCC_DCTL))
++    {
++        goto err_reset;
++    }
++    
++    /* Forced stop of writing configuration data */
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLCW, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLCW, DRPAI_BIT0);
++    offset_buf[0] = IDIF_DMACTLCW;
++    if(0 != wait_for_dma_stop(g_drp_base_addr[ch], offset_buf, 1))
++    {
++        goto err_reset;
++    }
++
++    /* Forced stop of data input / output */
++    /* IDIF_DMACTLI0,I1,I2,I3 */
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI0, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI1, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI2, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI3, DRPAI_BIT18);
++
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI0, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI1, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI2, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + IDIF_DMACTLI3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = IDIF_DMACTLI0;
++    offset_buf[1] = IDIF_DMACTLI1;
++    offset_buf[2] = IDIF_DMACTLI2;
++    offset_buf[3] = IDIF_DMACTLI3;
++    if(0 != wait_for_dma_stop(g_drp_base_addr[ch], offset_buf, 4)){
++        goto err_reset;
++    }
++
++    /* ODIF_DMACTLO0,O1,O2,O3 */
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO0, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO1, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO2, DRPAI_BIT18);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO3, DRPAI_BIT18);
++
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO0, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO1, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO2, DRPAI_BIT0);
++    reg_bit_clear(g_drp_base_addr[ch] + ODIF_DMACTLO3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = ODIF_DMACTLO0;
++    offset_buf[1] = ODIF_DMACTLO1;
++    offset_buf[2] = ODIF_DMACTLO2;
++    offset_buf[3] = ODIF_DMACTLO3;
++    if(0 != wait_for_dma_stop(g_drp_base_addr[ch], offset_buf, 4))
++    {
++        goto err_reset;
++    }
++
++    /* Set DRP core as fixed frequency mode  */
++    iowrite32((SET_STPC_CLKGEN_DIV & 0xFFFFFFFE), g_drp_base_addr[ch] + STPC_CLKGEN_DIV);
++
++    /* Soft reset */
++    spin_lock_irqsave(&priv->lock, flags);
++    iowrite32(0xFFFFFFFF, g_drp_base_addr[ch] + STPC_SFTRST);
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++err_reset:
++    ret = R_DRPAI_ERR_RESET;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_AIMAC_Reset(int32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    uint32_t offset_buf[4];
++
++    if (DRP_CH_NUM <= ch)
++    {
++        goto err_invalid_arg;
++    }
++
++    /* Descriptor prefetch stop */
++    reg_bit_clear(g_aimac_base_address[ch] + AID_DSCC_DCTL, DRPAI_BIT0);
++    if(0 != wait_for_desc_prefetch_stop(g_aimac_base_address[ch], AID_DSCC_DCTL))
++    {
++        goto err_reset;
++    }
++
++    /* Forced stop of inputting parameters (weights and bias values) */
++    reg_bit_clear(g_aimac_base_address[ch] + AID_IDIF_DMACTLI0, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + AID_IDIF_DMACTLI0, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = AID_IDIF_DMACTLI0;
++    if(0 != wait_for_dma_stop(g_aimac_base_address[ch], offset_buf, 1))
++    {
++        goto err_reset;
++    }
++
++    /* Forced stop of data input / output */
++    /* EXD0_IDIF_DMACTLI0,I1,I2,I3 */
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI0, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI1, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI2, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI3, DRPAI_BIT18);
++
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI0, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI1, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI2, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_IDIF_DMACTLI3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = EXD0_IDIF_DMACTLI0;
++    offset_buf[1] = EXD0_IDIF_DMACTLI1;
++    offset_buf[2] = EXD0_IDIF_DMACTLI2;
++    offset_buf[3] = EXD0_IDIF_DMACTLI3;
++    if(0 != wait_for_dma_stop(g_aimac_base_address[ch], offset_buf, 4))
++    {
++        goto err_reset;
++    }
++
++    /* EXD1_IDIF_DMACTLI0,I1,I2,I3 */
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI0, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI1, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI2, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI3, DRPAI_BIT18);
++
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI0, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI1, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI2, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_IDIF_DMACTLI3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = EXD1_IDIF_DMACTLI0;
++    offset_buf[1] = EXD1_IDIF_DMACTLI1;
++    offset_buf[2] = EXD1_IDIF_DMACTLI2;
++    offset_buf[3] = EXD1_IDIF_DMACTLI3;
++    if(0 != wait_for_dma_stop(g_aimac_base_address[ch], offset_buf, 4))
++    {
++        goto err_reset;
++    }
++
++    /* EXD0_ODIF_DMACTLO0,O1,O2,O3 */
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO0, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO1, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO2, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO3, DRPAI_BIT18);
++
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO0, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO1, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO2, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD0_ODIF_DMACTLO3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = EXD0_ODIF_DMACTLO0;
++    offset_buf[1] = EXD0_ODIF_DMACTLO1;
++    offset_buf[2] = EXD0_ODIF_DMACTLO2;
++    offset_buf[3] = EXD0_ODIF_DMACTLO3;
++    if(0 != wait_for_dma_stop(g_aimac_base_address[ch], offset_buf, 4))
++    {
++        goto err_reset;
++    }
++
++    /* EXD1_ODIF_DMACTLO0,O1,O2,O3 */
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO0, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO1, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO2, DRPAI_BIT18);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO3, DRPAI_BIT18);
++
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO0, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO1, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO2, DRPAI_BIT0);
++    reg_bit_clear(g_aimac_base_address[ch] + EXD1_ODIF_DMACTLO3, DRPAI_BIT0);
++
++    aimac_clear_synctbl_tbl(ch);
++
++    offset_buf[0] = EXD1_ODIF_DMACTLO0;
++    offset_buf[1] = EXD1_ODIF_DMACTLO1;
++    offset_buf[2] = EXD1_ODIF_DMACTLO2;
++    offset_buf[3] = EXD1_ODIF_DMACTLO3;
++    if(0 != wait_for_dma_stop(g_aimac_base_address[ch], offset_buf, 4))
++    {
++        goto err_reset;
++    }
++
++    /* Soft reset */
++    iowrite32(0xB1FF03FF, g_aimac_base_address[ch] + EXD0_STPC_SFTRST);
++    iowrite32(0xB1FF03FF, g_aimac_base_address[ch] + EXD1_STPC_SFTRST);
++    iowrite32(0x0000001F, g_aimac_base_address[ch] + CLKRSTCON_SFTRST);
++
++    /* Stop clock */
++    iowrite32(0x00000000, g_aimac_base_address[ch] + EXD0_STPC_CLKE);
++    iowrite32(0x00000000, g_aimac_base_address[ch] + EXD1_STPC_CLKE);
++    iowrite32(0x00000000, g_aimac_base_address[ch] + CLKRSTCON_CLKE);
++
++    /* Stop MCLKGEN */
++    iowrite32(0x00000001, g_aimac_base_address[ch] + EXD0_STPC_CLKGEN_STBYWAIT);
++
++    ret =  R_DRPAI_SUCCESS;
++    goto end;
++
++err_invalid_arg:
++    ret = R_DRPAI_ERR_INVALID_ARG;
++    goto end;
++err_reset:
++    ret = R_DRPAI_ERR_RESET;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return ret;
++}
++
++int32_t R_DRPAI_CPG_Reset(void)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int32_t ret;
++    uint32_t reg_val;
++    void __iomem *base;
++    const uint32_t CPG_BASE_ADDR = 0xA3500000;
++    const uint32_t CPG_CLK_ON20 = 0x44c;
++    const uint32_t CPG_RST9     = 0x620;
++    const uint32_t CPG_RST_MON  = 0x680;
++    int32_t i = 0;
++    bool is_stop = false;
++
++    base = ioremap_nocache(CPG_BASE_ADDR, 4096); // 4K Byte
++    if (!base) {
++        goto err_reset;
++    }
++
++    /* Set INITCLK as ON */
++    iowrite32(0x00040004, base + CPG_CLK_ON20);
++
++    /* Set DRPA Reset as ON */
++    usleep_range(RST_CPG_WAIT, RST_CPG_WAIT);
++    iowrite32(0x00010000, base + CPG_RST9);
++
++    /* Set DRPA Reset as OFF */
++    usleep_range(RST_CPG_WAIT, RST_CPG_WAIT);
++    iowrite32(0x00010001, base + CPG_RST9);
++
++    /* Check if DRPA reset is OFF */
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        udelay(1);
++        i++;
++        reg_val = ioread32(base + CPG_RST_MON);
++        if(0x0 != (reg_val & DRPAI_BIT14))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    i = 0;
++    while((RST_MAX_TIMEOUT > i) && (false == is_stop))
++    {
++        usleep_range(100, 200);
++        i++;
++        reg_val = ioread32(base + CPG_RST_MON);
++        if(0x0 != (reg_val & DRPAI_BIT14))
++        {
++            ; // Do nothing
++        }
++        else
++        {
++            is_stop = true;
++            break;
++        }
++    }
++
++    iounmap(base);
++    if(true == is_stop)
++    {
++        ret =  R_DRPAI_SUCCESS;
++    }
++    else
++    {
++        ret = R_DRPAI_ERR_RESET;
++        DRPAI_DEBUG_PRINT(KERN_INFO "%s: CPG_RST_MON = 0x%08X\n", __func__, reg_val);
++    }
++
++    goto end;
++err_reset:
++    ret = R_DRPAI_ERR_RESET;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++    return ret;
++}
++
++
++MODULE_DESCRIPTION("RZ/V2M DRP-AI driver");
++MODULE_AUTHOR("Renesas Electronics Corporation");
++MODULE_LICENSE("GPL v2");
+diff --git b/drivers/drpai/drpai-core.h b/drivers/drpai/drpai-core.h
+new file mode 100755
+index 0000000..47377fc
+--- /dev/null
++++ b/drivers/drpai/drpai-core.h
+@@ -0,0 +1,76 @@
++/*
++ * Driver for the Renesas RZ/V2M DRP-AI unit
++ *
++ * Copyright (C) 2021 Renesas Electronics Corporation
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef R_DRPAI_CORE_H
++#define R_DRPAI_CORE_H
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#include <linux/semaphore.h>
++#else /* __KERNEL__ */
++#include "r_typedefs.h"
++#endif /* __KERNEL__ */
++
++#define CH0                             (0)
++#define CH1                             (1)
++#define CH2                             (2)
++#define CH3                             (3)
++#define DRP_CH_NUM                      (1)
++#define AIMAC_CH_NUM                    (1)
++#define MAC256_CH_NUM                   (4)
++
++/* Error code */
++#define R_DRPAI_SUCCESS                 (0)
++#define R_DRPAI_ERR_INVALID_ARG         (-1)
++#define R_DRPAI_ERR_RESET               (-2)
++
++#define RST_CPG_WAIT (10)
++#define RST_MAX_TIMEOUT (100)
++
++// #define   DRPAI_DRV_DEBUG
++#ifdef  DRPAI_DRV_DEBUG
++#define DRPAI_DEBUG_PRINT(...)      printk(__VA_ARGS__)
++#else
++#define DRPAI_DEBUG_PRINT(...)
++#endif
++
++/* Type definitions */
++struct drpai_priv {
++    struct platform_device *pdev;
++    const char *dev_name;
++    drpai_status_t drpai_status;
++    spinlock_t lock;
++    struct semaphore sem;
++    refcount_t count;
++    void __iomem *drp_base;
++    void __iomem *aimac_base;
++    uint64_t bank;
++};
++
++int32_t R_DRPAI_DRP_Open(int32_t ch);
++int32_t R_DRPAI_DRP_Start(int32_t ch, uint32_t desc);
++int32_t R_DRPAI_DRP_Nmlint(int32_t ch);
++int32_t R_DRPAI_DRP_Errint(int32_t ch);
++int32_t R_DRPAI_AIMAC_Open(int32_t ch);
++int32_t R_DRPAI_AIMAC_Start(int32_t ch, uint32_t desc);
++int32_t R_DRPAI_AIMAC_Nmlint(int32_t ch);
++int32_t R_DRPAI_AIMAC_Errint(int32_t ch);
++int32_t R_DRPAI_Status(int32_t ch, drpai_status_t *drpai_status);
++int32_t R_DRPAI_DRP_Reset(int32_t ch);
++int32_t R_DRPAI_AIMAC_Reset(int32_t ch);
++int32_t R_DRPAI_CPG_Reset(void);
++
++#endif /* R_DRPAI_CORE_H */
+diff --git b/drivers/drpai/drpai-if.c b/drivers/drpai/drpai-if.c
+new file mode 100755
+index 0000000..618a778
+--- /dev/null
++++ b/drivers/drpai/drpai-if.c
+@@ -0,0 +1,2037 @@
++/*
++ * Driver for the Renesas RZ/V2M DRP-AI unit
++ *
++ * Copyright (C) 2021 Renesas Electronics Corporation
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <asm/cacheflush.h>
++#include <asm/current.h>
++#include <asm/io.h>
++#include <asm/uaccess.h>
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++#include <linux/fs.h>
++#include <asm/segment.h>
++#include <asm/uaccess.h>
++#include <linux/buffer_head.h>
++#include <linux/drpai.h>    /* Header file for DRP-AI Driver */
++#include "drpai-core.h"     /* Header file for DRP-AI Core */
++#include <linux/delay.h>
++#define DRPAI_DRIVER_VERSION         "1.00"
++#define DRPAI_DEV_NUM               (1)
++#define DRPAI_DRIVER_NAME           "drpai"     /* Device name */
++#define DRPAI_64BYTE_ALIGN          (0x3F)      /* Check 64-byte alignment */
++// #define   DRPAI_DRV_DEBUG
++#ifdef  DRPAI_DRV_DEBUG
++#define DRPAI_DEBUG_PRINT(...)      printk(__VA_ARGS__)
++#else
++#define DRPAI_DEBUG_PRINT(...)
++#endif
++#define DRPAI_STATUS_IDLE_RW        (10)
++#define DRPAI_STATUS_ASSIGN         (11)
++#define DRPAI_STATUS_DUMP_REG       (12)
++#define DRPAI_STATUS_READ_MEM       (13)
++#define DRPAI_STATUS_READ_REG       (14)
++#define DRPAI_STATUS_WRITE          (15)
++#define DRPAI_STATUS_ASSIGN_PARAM   (16)
++#define DRPAI_STATUS_WRITE_PARAM    (17)
++
++#define MAX_SEM_TIMEOUT (msecs_to_jiffies(1000))
++#define HEAD_SENTINEL (UINT_MAX)
++
++#define DRP_PARAM_MAX_LINE_LENGTH (512)
++#define DRP_PARAM_raddr           (0)
++#define DRP_PARAM_waddr           (4)
++#define DRP_PARAM_IMG_IWIDTH      (8)
++#define DRP_PARAM_IMG_IHEIGHT     (10)
++#define DRP_PARAM_IMG_OWIDTH      (16)
++#define DRP_PARAM_IMG_OHEIGHT     (18)
++#define DRP_PARAM_CROP_POS_X      (48)
++#define DRP_PARAM_CROP_POS_Y      (50)
++#define DRP_LIB_NAME_CROP         (",drp_lib:crop,")
++#define DRP_PARAM_ATTR_OFFSET_ADD ("OFFSET_ADD:")
++#define DRP_PARAM_ATTR_PROP_INPUT (",prop:input,")
++#define DRP_PARAM_ATTR_PROP_OUTPUT (",prop:output,")
++
++/*Macro definitions*/
++#define SYS_BASE         (0xA3F03000)
++#define SYS_SIZE         (1024)
++#define SYS_DRP_BANK     (0x38)
++#define SYS_MASK_DRP     (0x000000C0)
++#define SYS_SHIFT        (26)
++#define DRPAI_MASK_UPPER_BIT (0x0000000300000000)
++
++/* A function called from the kernel */
++static int drpai_probe(struct platform_device *pdev);
++static int drpai_remove(struct platform_device *pdev);
++static int drpai_open(struct inode *inode, struct file *file);
++static int drpai_close(struct inode *inode, struct file *file);
++static int drpai_flush(struct file *file, fl_owner_t id);
++static ssize_t  drpai_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
++static ssize_t  drpai_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
++static long drpai_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
++static unsigned int drpai_poll( struct file* filp, poll_table* wait );
++static irqreturn_t irq_drp_errint(int irq, void *dev);
++static irqreturn_t irq_mac_nmlint(int irq, void *dev);
++static irqreturn_t irq_mac_errint(int irq, void *dev);
++
++/* Internal function */
++static int drpai_regist_driver(void);
++static int drpai_regist_device(struct platform_device *pdev);
++static void drpai_unregist_driver(void);
++static void drpai_unregist_device(void);
++static void drpai_init_device(uint32_t ch);
++static int8_t drpai_reset_device(uint32_t ch);
++static long drpai_ioctl_assign(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_start(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_get_status(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_reset(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_reg_dump(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_assign_param(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_prepost_crop(struct file *filp, unsigned int cmd, unsigned long arg);
++static long drpai_ioctl_prepost_inaddr(struct file *filp, unsigned int cmd, unsigned long arg);
++static int8_t get_param_attr(char *line, char *attr, unsigned long *rvalue);
++static int8_t drp_param_change16(uint64_t base, uint64_t offset, uint16_t value);
++static int8_t drp_param_change32(uint64_t base, uint64_t offset, uint32_t value);
++static int8_t drpai_flush_dcache_input_area(uint64_t addr, uint64_t size);
++static int8_t drpai_get_sys_bank(uint64_t *bank);
++
++/* Linux device driver initialization */
++static const unsigned int MINOR_BASE = 0;
++static const unsigned int MINOR_NUM  = DRPAI_DEV_NUM;       /* Minor number */
++static unsigned int drpai_major;                    /* Major number (decided dinamically) */
++static struct cdev drpai_cdev;                      /* Character device object */
++static struct class *drpai_class = NULL;            /* class object */
++struct device *drpai_device_array[DRPAI_DEV_NUM];
++
++static DECLARE_WAIT_QUEUE_HEAD(drpai_waitq);
++
++struct drpai_priv *drpai_priv;
++
++struct drpai_rw_status {
++    uint32_t rw_status;
++    uint32_t read_count;
++    uint32_t write_count;
++    uint32_t drp_reg_offset_count;
++    uint32_t aimac_reg_offset_count;
++    drpai_data_t drpai_data;
++    struct list_head list;
++    drpai_assign_param_t assign_param;
++    char *param_info;
++    atomic_t inout_flag;
++};
++
++static DEFINE_SEMAPHORE(rw_sem);
++static struct drpai_rw_status *drpai_rw_sentinel;
++
++/* Virtual base address of register */
++void __iomem *g_drp_base_addr[DRP_CH_NUM];
++void __iomem *g_aimac_base_address[AIMAC_CH_NUM];
++static resource_size_t drp_size;
++static resource_size_t aimac_size;
++static resource_size_t drpai_region_base_addr;
++static resource_size_t drpai_region_size;
++static resource_size_t drpai_linux_mem_start;
++static resource_size_t drpai_linux_mem_size;
++
++/* handler table */
++static struct file_operations s_mydevice_fops = {
++    .open           = drpai_open,
++    .release        = drpai_close,
++    .write          = drpai_write,
++    .read           = drpai_read,
++    .unlocked_ioctl = drpai_ioctl,
++    .compat_ioctl   = drpai_ioctl, /* for 32-bit App */
++    .poll           = drpai_poll,
++    .flush          = drpai_flush,
++};
++static const struct of_device_id drpai_match[] = {
++
++    { .compatible = "renesas,rzv2m-drpai",},
++    { /* sentinel */ }
++};
++static struct platform_driver drpai_platform_driver = {
++    .driver = {
++        .name   = "drpai-rz",
++        .of_match_table = drpai_match,
++    },
++    .probe      = drpai_probe,
++    .remove     = drpai_remove,
++};
++
++static int drpai_probe(struct platform_device *pdev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    drpai_regist_driver();
++    drpai_regist_device(pdev);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++static int drpai_remove(struct platform_device *pdev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    drpai_unregist_driver();
++    drpai_unregist_device();
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++static int drpai_open(struct inode *inode, struct file *file)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int result = 0;
++    struct drpai_priv *priv = drpai_priv;
++    unsigned long flags;
++    struct drpai_rw_status *drpai_rw_status = 0;
++    uint64_t bank;
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) major %d minor %d\n", __func__, current->pid, imajor(inode), iminor(inode));
++
++    /* Allocate drpai_rw_status to each file descriptor */
++    drpai_rw_status = kzalloc(sizeof(struct drpai_rw_status), GFP_KERNEL);
++    if (!drpai_rw_status) 
++    {
++        result = -ENOMEM;
++        goto end;
++    }
++    /* Initialization flag */
++    drpai_rw_status->rw_status  = DRPAI_STATUS_IDLE_RW;
++    drpai_rw_status->param_info = NULL;
++    INIT_LIST_HEAD(&drpai_rw_status->list);
++    atomic_set(&drpai_rw_status->inout_flag, 0);
++    DRPAI_DEBUG_PRINT("[%s](pid %d) Generated list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->rw_status, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++    file->private_data = drpai_rw_status;
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:   %d\n", __func__, current->pid, priv->drpai_status.status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT)))
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++
++    if(likely((1 == refcount_read(&priv->count)) && (1 == atomic_long_read(&file->f_count))))
++    {
++        DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) Initialize DRP-AI\n", __func__, current->pid);
++
++        /* Initialize DRP-AI */
++        drpai_init_device(0);
++
++        /* Reset DRP-AI */
++        if(R_DRPAI_SUCCESS != drpai_reset_device(0))
++        {
++            result = -EIO;
++            goto end;
++        }
++
++        /* Initialize DRP-AI */
++        drpai_init_device(0);
++
++        /* Get sys register value */
++        if(0 != drpai_get_sys_bank(&bank))
++        {
++            result = -EFAULT;
++            goto end;
++        }
++
++        /* INIT -> IDLE */
++        spin_lock_irqsave(&priv->lock, flags);
++        priv->drpai_status.status = DRPAI_STATUS_IDLE;
++        priv->bank = bank;
++        spin_unlock_irqrestore(&priv->lock, flags);
++    }
++    /* Increment reference count */
++    refcount_inc(&priv->count);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:   %d\n", __func__, current->pid, priv->drpai_status.status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    result = 0;
++    goto end;
++end:
++    if((-ENOMEM != result) || (-ETIMEDOUT != result))
++    {
++        up(&priv->sem);
++    }
++    if((0 != drpai_rw_status) && (0 != result))
++    {
++        kfree(file->private_data);
++        file->private_data = NULL;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static int drpai_close(struct inode *inode, struct file *file)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) major %d minor %d\n", __func__, current->pid, imajor(inode), iminor(inode));
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++static int drpai_flush(struct file *file, fl_owner_t id)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int result = 0;
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++    struct drpai_rw_status *drpai_rw_status = file->private_data;
++    struct drpai_rw_status *entry;
++    struct list_head *listitr;
++
++    if(unlikely(down_interruptible(&rw_sem))) 
++    {
++        result = -ERESTART;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT("[%s](pid %d) HEAD  list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_sentinel->list, drpai_rw_sentinel->rw_status, drpai_rw_sentinel->list.prev, drpai_rw_sentinel->list.next);
++    if(!list_empty(&drpai_rw_sentinel->list))
++    {
++        if((DRPAI_STATUS_ASSIGN   == drpai_rw_status->rw_status) || 
++           (DRPAI_STATUS_READ_MEM == drpai_rw_status->rw_status) ||
++           (DRPAI_STATUS_WRITE    == drpai_rw_status->rw_status))
++           {
++                DRPAI_DEBUG_PRINT("[%s](pid %d) Deleted list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->rw_status, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++                list_del(&drpai_rw_status->list);
++           }
++    }
++    up(&rw_sem);
++
++    if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT))) 
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:   %d\n", __func__, current->pid, priv->drpai_status.status);
++
++    if(1 == atomic_long_read(&file->f_count))
++    {
++        if(2 == refcount_read(&priv->count))
++        {
++            DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start DRP-AI reset\n", __func__, current->pid);
++            if(R_DRPAI_SUCCESS != drpai_reset_device(0))
++            {
++                result = -EIO;
++                goto end;
++            }
++
++            /* IDLE -> INIT */
++            /* RUN  -> INIT */
++            spin_lock_irqsave(&priv->lock, flags);
++            priv->drpai_status.status = DRPAI_STATUS_INIT;
++            priv->drpai_status.err    = DRPAI_ERRINFO_SUCCESS;
++            spin_unlock_irqrestore(&priv->lock, flags);
++
++            DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) done DRP-AI reset\n", __func__, current->pid);
++        }
++        /* Decrement referenece count*/
++        refcount_dec(&priv->count);
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:   %d\n", __func__, current->pid, priv->drpai_status.status);
++
++    goto end;
++end:
++    if((-ERESTART != result) || (-ETIMEDOUT != result))
++    {
++        up(&priv->sem);
++    }
++    if(1 == atomic_long_read(&file->f_count))
++    {
++        /* Free memory */
++        if(NULL != drpai_rw_status->param_info)
++        {
++            DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) vfree is called\n", __func__, current->pid);
++            vfree(drpai_rw_status->param_info);
++            drpai_rw_status->param_info = NULL;
++        }
++        if(file->private_data) 
++        {
++            DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) kfree is called\n", __func__, current->pid);
++            kfree(file->private_data);
++            file->private_data = NULL;
++        }
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static ssize_t  drpai_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    ssize_t result = 0;
++    uint8_t *kbuf = NULL;
++    volatile void *p_drpai_cma = 0;
++    struct drpai_priv *priv = drpai_priv;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    uint64_t addr;
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check status */
++    if (!((DRPAI_STATUS_ASSIGN == drpai_rw_status->rw_status) || 
++          (DRPAI_STATUS_WRITE == drpai_rw_status->rw_status) ||
++          (DRPAI_STATUS_ASSIGN_PARAM == drpai_rw_status->rw_status) ||
++          (DRPAI_STATUS_WRITE_PARAM == drpai_rw_status->rw_status)))
++    {
++        result = -EACCES;
++        goto end;
++    }
++
++    /* Check Argument */
++    if (NULL == buf)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if (0 == count)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    switch(drpai_rw_status->rw_status)
++    {
++        case DRPAI_STATUS_ASSIGN:
++            /* DRPAI_STATUS_ASSIGN -> DRPAI_STATUS_WRITE */
++            drpai_rw_status->rw_status = DRPAI_STATUS_WRITE;
++            break;
++        case DRPAI_STATUS_ASSIGN_PARAM:
++            /* DRPAI_STATUS_ASSIGN_PARAM -> DRPAI_STATUS_WRITE_PARAM */
++            drpai_rw_status->rw_status = DRPAI_STATUS_WRITE_PARAM;
++            break;
++        default:
++            ; /* Do nothing */
++            break;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    switch(drpai_rw_status->rw_status)
++    {
++        case DRPAI_STATUS_WRITE:
++            /* Secure Kbuf area */
++            kbuf = vmalloc(count);
++            if (NULL == kbuf)
++            {
++                result = -ENOMEM;
++                goto end;
++            }
++            /* Copy arguments from user space to kernel space */
++            if (copy_from_user(kbuf, buf, count))
++            {
++                result = -EFAULT;
++                goto end;
++            }
++
++            /* Expand to DRP for CMA */
++            addr = priv->bank | (uint64_t)drpai_rw_status->drpai_data.address;
++            p_drpai_cma = phys_to_virt(addr + (uint64_t)drpai_rw_status->write_count);
++            if (p_drpai_cma == 0)
++            {
++                result = -EFAULT;
++                goto end;
++            }
++            if ( !( drpai_rw_status->drpai_data.size >= (drpai_rw_status->write_count + count) ) )
++            {
++                count = drpai_rw_status->drpai_data.size - drpai_rw_status->write_count;
++            }
++            memcpy(p_drpai_cma, kbuf, count);
++            drpai_rw_status->write_count = drpai_rw_status->write_count + count;
++
++            /* DRPAI_STATUS_WRITE -> DRPAI_STATUS_IDLE_RW */
++            if (drpai_rw_status->drpai_data.size <= drpai_rw_status->write_count)
++            {
++                p_drpai_cma = phys_to_virt(addr);
++                if (p_drpai_cma == 0)
++                {
++                    result = -EFAULT;
++                    goto end;
++                }
++                __flush_dcache_area(p_drpai_cma, drpai_rw_status->drpai_data.size);
++                drpai_rw_status->rw_status = DRPAI_STATUS_IDLE_RW;
++                DRPAI_DEBUG_PRINT("[%s](pid %d) Deleted list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->rw_status, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++                list_del(&drpai_rw_status->list);
++                drpai_rw_status->drpai_data.address = 0x0;
++                drpai_rw_status->drpai_data.size    = 0x0;
++            }
++            result = count;
++            break;
++        case DRPAI_STATUS_WRITE_PARAM:
++            if ( !( drpai_rw_status->assign_param.info_size >= (drpai_rw_status->write_count + count) ) )
++            {
++                count = drpai_rw_status->assign_param.info_size - drpai_rw_status->write_count;
++            }
++            /* Copy arguments from user space to kernel space */
++            if (copy_from_user(&drpai_rw_status->param_info[drpai_rw_status->write_count], buf, count))
++            {
++                result = -EFAULT;
++                goto end;
++            }
++            drpai_rw_status->write_count = drpai_rw_status->write_count + count;
++            /* DRPAI_STATUS_WRITE_PARAM -> DRPAI_STATUS_IDLE_RW */
++            if (drpai_rw_status->assign_param.info_size <= drpai_rw_status->write_count)
++            {
++                DRPAI_DEBUG_PRINT("[%s](pid %d) Status is changed \n", __func__, current->pid);
++                drpai_rw_status->rw_status = DRPAI_STATUS_IDLE_RW;
++            }
++            result = count;
++            break;
++        default:
++            ; /* Do nothing */
++            break;
++    }
++    goto end;
++end:
++    if(-ERESTART != result)
++    {
++        up(&rw_sem);
++    }
++    if (NULL != kbuf)
++    {
++        /* Free kbuf */
++        vfree(kbuf);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw3:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static ssize_t drpai_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    ssize_t result = 0;
++    uint8_t *kbuf = NULL;
++    volatile void *p_drpai_cma = 0;
++    uint32_t reg_val;
++    uint32_t i;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    struct drpai_priv *priv = drpai_priv;
++    uint64_t addr;
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check status */
++    if (!((DRPAI_STATUS_ASSIGN  == drpai_rw_status->rw_status) ||
++        (DRPAI_STATUS_DUMP_REG  == drpai_rw_status->rw_status) ||
++        (DRPAI_STATUS_READ_MEM  == drpai_rw_status->rw_status) ||
++        (DRPAI_STATUS_READ_REG  == drpai_rw_status->rw_status)))
++    {
++        result = -EACCES;
++        goto end;
++    }
++
++    /* Check Argument */
++    if (NULL == buf)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if (0 == count)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Secure Kbuf area */
++    kbuf = vmalloc(count);
++    if (NULL == kbuf)
++    {
++        result = -ENOMEM;
++        goto end;
++    }
++
++    switch(drpai_rw_status->rw_status)
++    {
++        case DRPAI_STATUS_ASSIGN:
++            /* DRPAI_STATUS_ASSIGN -> DRPAI_STATUS_READ_MEM */
++            drpai_rw_status->rw_status = DRPAI_STATUS_READ_MEM;
++            break;
++        case DRPAI_STATUS_DUMP_REG:
++            /* DRPAI_STATUS_DUMP_REG -> DRPAI_STATUS_READ_REG */
++            drpai_rw_status->rw_status = DRPAI_STATUS_READ_REG;
++            break;
++        default:
++            ; /* Do nothing */
++            break;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    switch(drpai_rw_status->rw_status)
++    {
++        case DRPAI_STATUS_READ_MEM:
++            /* Read DRP-AI memory */
++            addr = priv->bank | (uint64_t)drpai_rw_status->drpai_data.address;
++            p_drpai_cma = phys_to_virt(addr + drpai_rw_status->read_count);
++            if (p_drpai_cma == 0)
++            {
++                result = -EFAULT;
++                goto end;
++            }
++            if ( !( drpai_rw_status->drpai_data.size >= (drpai_rw_status->read_count + count) ) )
++            {
++                count = drpai_rw_status->drpai_data.size - drpai_rw_status->read_count;
++            }
++            memcpy(kbuf, p_drpai_cma, count);
++            drpai_rw_status->read_count = drpai_rw_status->read_count + count;
++
++            /* DRPAI_STATUS_READ -> DRPAI_STATUS_IDLE_RW */
++            if (drpai_rw_status->drpai_data.size <= drpai_rw_status->read_count)
++            {
++                drpai_rw_status->rw_status = DRPAI_STATUS_IDLE_RW;
++                DRPAI_DEBUG_PRINT("[%s](pid %d) Deleted list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->rw_status, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++                list_del(&drpai_rw_status->list);
++                drpai_rw_status->drpai_data.address = 0x0;
++                drpai_rw_status->drpai_data.size    = 0x0;
++            }
++            i = count;
++            break;
++        case DRPAI_STATUS_READ_REG:
++            /* Read DRP-AI register */
++            if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT))) 
++            {
++                result = -ETIMEDOUT;
++                goto end;
++            }
++            for (i = 0; i < count; i+=4)
++            {
++                if (drp_size > drpai_rw_status->read_count)
++                {
++                    reg_val = ioread32(g_drp_base_addr[0] + drpai_rw_status->drp_reg_offset_count);
++                    *(kbuf + i)     = (uint8_t)reg_val;
++                    *(kbuf + i + 1) = (uint8_t)(reg_val >> 8);
++                    *(kbuf + i + 2) = (uint8_t)(reg_val >> 16);
++                    *(kbuf + i + 3) = (uint8_t)(reg_val >> 24);
++                    drpai_rw_status->drp_reg_offset_count+=4;
++                }
++                else
++                {
++                    reg_val = ioread32(g_aimac_base_address[0] + drpai_rw_status->aimac_reg_offset_count);
++                    *(kbuf + i)     = (uint8_t)reg_val;
++                    *(kbuf + i + 1) = (uint8_t)(reg_val >> 8);
++                    *(kbuf + i + 2) = (uint8_t)(reg_val >> 16);
++                    *(kbuf + i + 3) = (uint8_t)(reg_val >> 24);
++                    drpai_rw_status->aimac_reg_offset_count+=4;
++                }
++                drpai_rw_status->read_count+=4;
++
++                /* DRPAI_STATUS_READ_REG -> DRPAI_STATUS_IDLE_RW */
++                if ((drp_size + aimac_size) <= drpai_rw_status->read_count)
++                {
++                    drpai_rw_status->rw_status = DRPAI_STATUS_IDLE_RW;
++                    i+=4;
++                    break;
++                }
++            }
++            up(&priv->sem);
++            break;
++        default:
++            ; /* Do nothing */
++            break;
++    }
++
++    /* Copy arguments from kernel space to user space */
++    if (copy_to_user(buf, kbuf, count))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++
++    result = i;
++    goto end;
++end:
++    if(-ERESTART != result)
++    {
++        up(&rw_sem);
++    }
++    if (NULL != kbuf)
++    {
++        /* Free kbuf */
++        vfree(kbuf);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw3:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    long result = 0;
++
++    switch (cmd) {
++    case DRPAI_ASSIGN:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_ASSIGN)](pid %d)\n", current->pid);
++        result = drpai_ioctl_assign(filp, cmd, arg);
++        break;
++    case DRPAI_START:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_START)](pid %d)\n", current->pid);
++        result = drpai_ioctl_start(filp, cmd, arg);
++        break;
++    case DRPAI_RESET:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_RESET)](pid %d)\n", current->pid);
++        result = drpai_ioctl_reset(filp, cmd, arg);
++        break;
++    case DRPAI_GET_STATUS:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_GET_STATUS)](pid %d)\n", current->pid);
++        result = drpai_ioctl_get_status(filp, cmd, arg);
++        break;
++    case DRPAI_REG_DUMP:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_REG_DUMP)](pid %d)\n", current->pid);
++        result = drpai_ioctl_reg_dump(filp, cmd, arg);
++        break;
++    case DRPAI_ASSIGN_PARAM:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_ASSIGN_PARAM)](pid %d)\n", current->pid);
++        result = drpai_ioctl_assign_param(filp, cmd, arg);
++        break;
++    case DRPAI_PREPOST_CROP:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_PREPOST_CROP)](pid %d)\n", current->pid);
++        result = drpai_ioctl_prepost_crop(filp, cmd, arg);
++        break;
++    case DRPAI_PREPOST_INADDR:
++        DRPAI_DEBUG_PRINT(KERN_INFO "[ioctl(DRPAI_PREPOST_INADDR)](pid %d)\n", current->pid);
++        result = drpai_ioctl_prepost_inaddr(filp, cmd, arg);
++        break;
++    default:
++        DRPAI_DEBUG_PRINT(KERN_WARNING "unsupported command %d\n", cmd);
++        result = -EFAULT;
++        break;
++    }
++    goto end;
++
++end:
++    return result;
++}
++
++static unsigned int drpai_poll( struct file* filp, poll_table* wait )
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    unsigned int retmask = 0;
++    struct drpai_priv *priv = drpai_priv;
++    unsigned long flags;
++
++    spin_lock_irqsave(&priv->lock, flags);
++
++    poll_wait( filp, &drpai_waitq,  wait );
++
++    if (DRPAI_STATUS_IDLE == priv->drpai_status.status)
++    {
++        retmask |= ( POLLIN  | POLLRDNORM );
++    }
++
++    spin_unlock_irqrestore(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return retmask;
++}
++static irqreturn_t irq_drp_errint(int irq, void *dev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    spin_lock_irqsave(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:%d\n", __func__, current->pid, priv->drpai_status.status);
++
++    /* DRP error interrupt processing */
++    R_DRPAI_DRP_Errint(0);
++
++    /* Internal state update */
++    priv->drpai_status.err = DRPAI_ERRINFO_DRP_ERR;
++    priv->drpai_status.status = DRPAI_STATUS_IDLE;
++
++    /* Wake up the process */
++    wake_up_interruptible( &drpai_waitq );
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:%d\n", __func__, current->pid, priv->drpai_status.status);
++    spin_unlock_irqrestore(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return IRQ_HANDLED;
++}
++
++static irqreturn_t irq_mac_nmlint(int irq, void *dev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    spin_lock_irqsave(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:%d\n", __func__, current->pid, priv->drpai_status.status);
++
++    /* AI-MAC normal interrupt processing */
++    R_DRPAI_AIMAC_Nmlint(0);
++
++    /* Internal state update */
++    priv->drpai_status.status = DRPAI_STATUS_IDLE;
++
++    /* Wake up the process */
++    wake_up_interruptible( &drpai_waitq );
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:%d\n", __func__, current->pid, priv->drpai_status.status);
++    spin_unlock_irqrestore(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return IRQ_HANDLED;
++}
++static irqreturn_t irq_mac_errint(int irq, void *dev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    unsigned long flags;
++    struct drpai_priv *priv = drpai_priv;
++
++    spin_lock_irqsave(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:%d\n", __func__, current->pid, priv->drpai_status.status);
++
++    /* AI-MAC error interrupt processing */
++    R_DRPAI_AIMAC_Errint(0);
++
++    /* Internal state update */
++    priv->drpai_status.err = DRPAI_ERRINFO_AIMAC_ERR;
++    priv->drpai_status.status = DRPAI_STATUS_IDLE;
++
++    /* Wake up the process */
++    wake_up_interruptible( &drpai_waitq );
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:%d\n", __func__, current->pid, priv->drpai_status.status);
++    spin_unlock_irqrestore(&priv->lock, flags);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return IRQ_HANDLED;
++}
++
++static int drpai_regist_driver(void)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int alloc_ret = 0;
++    int cdev_err = 0;
++    dev_t dev;
++
++    printk(KERN_INFO "DRP-AI Driver version : %s\n", DRPAI_DRIVER_VERSION);
++
++    /* Get free major number. */
++    alloc_ret = alloc_chrdev_region(&dev, MINOR_BASE, MINOR_NUM, DRPAI_DRIVER_NAME);
++    if (alloc_ret != 0) {
++        printk(KERN_ERR "alloc_chrdev_region = %d\n", alloc_ret);
++        return -1;
++    }
++
++    /* Save major number. */
++    drpai_major = MAJOR(dev);
++    dev = MKDEV(drpai_major, MINOR_BASE);
++
++    /* Initialize cdev and registration handler table. */
++    cdev_init(&drpai_cdev, &s_mydevice_fops);
++    drpai_cdev.owner = THIS_MODULE;
++
++    /* Registration cdev */
++    cdev_err = cdev_add(&drpai_cdev, dev, MINOR_NUM);
++    if (cdev_err != 0) {
++        printk(KERN_ERR  "cdev_add = %d\n", cdev_err);
++        unregister_chrdev_region(dev, MINOR_NUM);
++        return -1;
++    }
++
++    /* Cleate class "/sys/class/drpai/" */
++    drpai_class = class_create(THIS_MODULE, DRPAI_DRIVER_NAME);
++    if (IS_ERR(drpai_class)) {
++        printk(KERN_ERR  "class_create = %d\n", drpai_class);
++        cdev_del(&drpai_cdev);
++        unregister_chrdev_region(dev, MINOR_NUM);
++        return -1;
++    }
++
++    int minor;
++    /* Make "/sys/class/drpai/drpai*" */
++    for (minor = MINOR_BASE; minor < MINOR_BASE + MINOR_NUM; minor++) {
++        drpai_device_array[minor - MINOR_BASE] =
++        device_create(drpai_class, NULL, MKDEV(drpai_major, minor), NULL, DRPAI_DRIVER_NAME "%d", minor);
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++static int drpai_regist_device(struct platform_device *pdev)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    struct resource *res;
++    struct resource reserved_res;
++    struct device_node *np;
++    struct drpai_priv *priv;
++    struct drpai_rw_status *drpai_rw_status;
++    int irq, ret;
++    void __iomem *base;
++
++    /* Intialize DRP-AI status to control */
++    priv = devm_kzalloc(&pdev->dev, sizeof(struct drpai_priv), GFP_KERNEL);
++    if (!priv) {
++        dev_err(&pdev->dev, "cannot allocate private data\n");
++        return -ENOMEM;
++    }
++
++    platform_set_drvdata(pdev, priv);
++    priv->pdev = pdev;
++    priv->dev_name = dev_name(&pdev->dev);
++    spin_lock_init(&priv->lock);
++    sema_init(&priv->sem, DRPAI_DEV_NUM);
++    refcount_set(&priv->count, 1);
++    priv->drpai_status.status = DRPAI_STATUS_INIT; 
++    priv->drpai_status.err    = DRPAI_ERRINFO_SUCCESS;
++    drpai_priv = priv;
++
++    /* Initialize list head */
++    drpai_rw_status = devm_kzalloc(&pdev->dev, sizeof(struct drpai_rw_status), GFP_KERNEL);
++    if (!drpai_rw_status) {
++        dev_err(&pdev->dev, "cannot allocate sentinel data\n");
++        return -ENOMEM;
++    }
++    drpai_rw_status->rw_status  = HEAD_SENTINEL;
++    drpai_rw_status->param_info = NULL;
++    INIT_LIST_HEAD(&drpai_rw_status->list);
++    atomic_set(&drpai_rw_status->inout_flag, 0);
++    drpai_rw_sentinel = drpai_rw_status;
++    DRPAI_DEBUG_PRINT("[%s](pid %d) HEAD  list %px rw_status %d prev %px next %px\n", __func__, current->pid, &drpai_rw_sentinel->list, drpai_rw_sentinel->rw_status, drpai_rw_sentinel->list.prev, drpai_rw_sentinel->list.next);
++
++    /* Get reserved memory region from Device tree.*/
++    np = of_parse_phandle(pdev->dev.of_node, "memory-region", 0);
++    if (!np) {
++        dev_err(&pdev->dev, "No %s specified\n", "memory-region");
++        return -ENOMEM;
++    }
++
++    /* Convert memory region to a struct resource */
++    ret = of_address_to_resource(np, 0, &reserved_res);
++    if (ret) {
++        dev_err(&pdev->dev, "No memory address assigned to the region\n");
++        return -ENOMEM;
++    }
++    drpai_region_base_addr = reserved_res.start;
++    drpai_region_size = resource_size(&reserved_res);
++    printk(KERN_INFO "DRP-AI memory region start 0x%016llX, size 0x%08X\n", drpai_region_base_addr, drpai_region_size);
++
++    /* Get linux memory region from Device tree.*/
++    np = of_parse_phandle(pdev->dev.of_node, "linux-memory-region", 0);
++    if (!np) {
++        dev_err(&pdev->dev, "No %s specified\n", "linux-memory-region");
++        return -ENOMEM;
++    }
++
++    /* read linux start address and size */
++    ret = of_address_to_resource(np, 0, &reserved_res);
++    if (ret) {
++        dev_err(&pdev->dev, "No address assigned to the linux-memory-region\n");
++        return -ENOMEM;
++    }
++    drpai_linux_mem_start = reserved_res.start;
++    drpai_linux_mem_size = resource_size(&reserved_res);
++    printk(KERN_INFO "linux-memory-region start 0x%016llX, size 0x%08X\n", drpai_linux_mem_start, drpai_linux_mem_size);
++
++    /* Convert DRP base address from physical to virtual */
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++    if (!res) {
++        dev_err(&pdev->dev, "cannot get resources (reg)\n");
++        return -EINVAL;
++    }
++    priv->drp_base = devm_ioremap_nocache(&pdev->dev, res->start, resource_size(res));
++    if (!priv->drp_base) {
++        dev_err(&pdev->dev, "cannot ioremap\n");
++        return -EINVAL;
++    }
++    g_drp_base_addr[0] = priv->drp_base;
++    drp_size = resource_size(res);
++    printk(KERN_INFO "DRP base address 0x%08X, size 0x%08X\n", res->start, drp_size);
++
++    /* Convert AI-MAC base address from physical to virtual */
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++    if (!res) {
++        dev_err(&pdev->dev, "cannot get resources (reg)\n");
++        return -EINVAL;
++    }
++    priv->aimac_base = devm_ioremap_nocache(&pdev->dev, res->start, resource_size(res));
++    if (!priv->aimac_base) {
++        dev_err(&pdev->dev, "cannot ioremap\n");
++        return -EINVAL;
++    }
++    g_aimac_base_address[0] = priv->aimac_base;
++    aimac_size = resource_size(res);
++    printk(KERN_INFO "AI-MAC base address 0x%08X, size 0x%08X\n", res->start, aimac_size);
++
++    /* Registering an interrupt handler */
++    irq = platform_get_irq(pdev, 1);
++    ret = devm_request_irq(&pdev->dev, irq, irq_drp_errint, 0, "drpa errint", priv);
++    if (ret) {
++        dev_err(&pdev->dev, "Failed to claim IRQ!\n");
++        return ret;
++    }
++    irq = platform_get_irq(pdev, 2);
++    ret = devm_request_irq(&pdev->dev, irq, irq_mac_nmlint, 0, "drpa mac_nmlint", priv);
++    if (ret) {
++        dev_err(&pdev->dev, "Failed to claim IRQ!\n");
++        return ret;
++    }
++    irq = platform_get_irq(pdev, 3);
++    ret = devm_request_irq(&pdev->dev, irq, irq_mac_errint, 0, "drpa mac_errint", priv);
++    if (ret) {
++        dev_err(&pdev->dev, "Failed to claim IRQ!\n");
++        return ret;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return 0;
++}
++
++static void drpai_unregist_driver(void)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    dev_t dev = MKDEV(drpai_major, MINOR_BASE);
++
++    int minor;
++    /* Delete "/sys/class/mydevice/mydevice*". */
++    for (minor = MINOR_BASE; minor < MINOR_BASE + MINOR_NUM; minor++) {
++        device_destroy(drpai_class, MKDEV(drpai_major, minor));
++    }
++
++    /* Destroy "/sys/class/mydevice/". */
++    class_destroy(drpai_class);
++
++    /* Delete cdev from kernel. */
++    cdev_del(&drpai_cdev);
++
++    /* Unregistration */
++    unregister_chrdev_region(dev, MINOR_NUM);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++}
++
++static void drpai_unregist_device(void)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    /* Do nothing */
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++}
++
++static int8_t drpai_reset_device(uint32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    int8_t retval;
++
++    /* Reset DRP */
++    if(R_DRPAI_SUCCESS != R_DRPAI_DRP_Reset(ch)) {
++        goto err_reset;
++    }
++
++    /* Reset AI-MAC */
++    if(R_DRPAI_SUCCESS != R_DRPAI_AIMAC_Reset(ch)) {
++        goto err_reset;
++    }
++
++    /* Reset CPG register */
++    if(R_DRPAI_SUCCESS != R_DRPAI_CPG_Reset()) {
++        goto err_reset;
++    }
++
++    retval = R_DRPAI_SUCCESS;
++    goto end;
++err_reset:
++    retval = R_DRPAI_ERR_RESET;
++    goto end;
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return retval;
++}
++
++static void drpai_init_device(uint32_t ch)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    (void)R_DRPAI_DRP_Open(0);
++    (void)R_DRPAI_AIMAC_Open(0);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++}
++
++static long drpai_ioctl_assign(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    long result = 0;
++    volatile void *p_virt_address = 0;
++    struct drpai_priv *priv = drpai_priv;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    struct drpai_rw_status *entry;
++    struct list_head *listitr;
++    drpai_data_t drpai_data_buf;
++    uint64_t addr, size;
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) (pid %d)\n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Check status */
++    if (DRPAI_STATUS_IDLE_RW != drpai_rw_status->rw_status)
++    {
++        result = -EACCES;
++        goto end;
++    }
++
++    /* Copy arguments from user space to kernel space */
++    if (copy_from_user(&drpai_data_buf, (void __user *)arg, sizeof(drpai_data_t)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Check Argument */
++    addr = priv->bank | (uint64_t)drpai_data_buf.address;
++    size = (uint64_t)drpai_data_buf.size;
++    if (0 != (addr & DRPAI_64BYTE_ALIGN))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    if ((drpai_region_base_addr > addr) || 
++       ((drpai_region_base_addr + drpai_region_size) <= (addr + size)))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    if(priv->bank != (drpai_region_base_addr & DRPAI_MASK_UPPER_BIT))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++
++    /* Check the assigned address */
++    DRPAI_DEBUG_PRINT("[%s](pid %d) list %px prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++    if(!list_empty(&drpai_rw_sentinel->list))
++    {   
++        DRPAI_DEBUG_PRINT("[%s](pid %d) List is not empty\n", __func__, current->pid);
++        list_for_each(listitr, &drpai_rw_sentinel->list)
++        {
++            entry = list_entry(listitr, struct drpai_rw_status, list);
++            DRPAI_DEBUG_PRINT("[%s](pid %d) rw_status %d list %px prev %px next %px\n", __func__, current->pid, entry->rw_status, &entry->list, entry->list.prev, entry->list.next);
++            if(HEAD_SENTINEL != entry->rw_status)
++            {
++                if( !( (entry->drpai_data.address > (drpai_data_buf.address + drpai_data_buf.size - 1)) ||
++                       ((entry->drpai_data.address + entry->drpai_data.size - 1) < drpai_data_buf.address) ))
++                {
++                    result = -EINVAL;
++                    goto end;
++                }
++            }
++        }
++    }
++
++    /* Data cache invalidate. DRP-AI W -> CPU R */
++    addr = priv->bank | (uint64_t)drpai_data_buf.address;
++    p_virt_address = phys_to_virt(addr);
++    if (p_virt_address == 0)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    __inval_dcache_area(p_virt_address, drpai_data_buf.size);
++
++    /* Initialization of read / write processing variables */
++    drpai_rw_status->drpai_data  = drpai_data_buf;
++    drpai_rw_status->rw_status   = DRPAI_STATUS_ASSIGN;
++    drpai_rw_status->write_count = 0;
++    drpai_rw_status->read_count  = 0;
++    /* Register assigned status */
++    list_add(&drpai_rw_status->list, &drpai_rw_sentinel->list);
++    DRPAI_DEBUG_PRINT("[%s](pid %d) Registered list %px prev %px next %px\n", __func__, current->pid, &drpai_rw_status->list, drpai_rw_status->list.prev, drpai_rw_status->list.next);
++
++    goto end;
++end:
++    if(-ERESTART != result)
++    {
++        up(&rw_sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_start(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int result = 0;
++    drpai_data_t proc[DRPAI_INDEX_NUM];
++    volatile void *p_drp_param = 0;
++    volatile void *p_drp_desc = 0;
++    volatile void *p_aimac_desc = 0;
++    struct drpai_priv *priv = drpai_priv;
++    unsigned long flags;
++    int i;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    uint64_t addr, size;
++
++    if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT))) 
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:%d\n", __func__, current->pid, priv->drpai_status.status);
++
++    /* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Check status */
++    spin_lock_irqsave(&priv->lock, flags);
++    if (DRPAI_STATUS_RUN == priv->drpai_status.status)
++    {
++        spin_unlock_irqrestore(&priv->lock, flags);
++        result = -EBUSY;
++        goto end;
++    }
++    spin_unlock_irqrestore(&priv->lock, flags);
++    /* Copy arguments from user space to kernel space */
++    if (copy_from_user(&proc[0], (void __user *)arg, sizeof(proc)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Check Argument */
++    for (i = DRPAI_INDEX_DRP_DESC; i < DRPAI_INDEX_NUM; i++)
++    {
++        addr = priv->bank | (uint64_t)proc[i].address;
++        size = (uint64_t)proc[i].size;
++        if (0 != (addr & DRPAI_64BYTE_ALIGN))
++        {
++            result = -EINVAL;
++            goto end;
++        }
++        if ((drpai_region_base_addr > addr) || 
++           ((drpai_region_base_addr + drpai_region_size) <= (addr + size)))
++            {
++                result = -EINVAL;
++                goto end;
++            }
++    }
++
++    /* Check if input is in linux memory region */
++    if(0 == atomic_read(&drpai_rw_status->inout_flag))
++    {
++        DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) Use arg variable\n", __func__, current->pid);
++        addr = priv->bank | (uint64_t)proc[DRPAI_INDEX_INPUT].address;
++        size = (uint64_t)proc[DRPAI_INDEX_INPUT].size;
++        if(0 != drpai_flush_dcache_input_area(addr, size))
++        {
++            result = -EFAULT;
++            goto end;
++        }
++        /* Change input address to value specified by user app. */
++        addr = priv->bank | (uint64_t)proc[DRPAI_INDEX_DRP_PARAM].address;
++        if(0 != drp_param_change32(addr, 0, proc[DRPAI_INDEX_INPUT].address))
++        {
++            result = -EFAULT;
++            goto end;
++        }
++    }
++    
++    /* drp_desc.bin */
++    addr = priv->bank | (uint64_t)proc[DRPAI_INDEX_DRP_DESC].address;
++    p_drp_desc = phys_to_virt(addr);
++    if (p_drp_desc == 0)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Changed link descriptor of drp_desc.bin */
++    if (0 != (proc[DRPAI_INDEX_DRP_DESC].size & 0x0F))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    iowrite8(0x08, p_drp_desc + proc[DRPAI_INDEX_DRP_DESC].size - 13);
++    __flush_dcache_area(p_drp_desc + proc[DRPAI_INDEX_DRP_DESC].size - 13, 1);
++
++    /* aimac_desc.bin */
++    addr = priv->bank | (uint64_t)proc[DRPAI_INDEX_AIMAC_DESC].address;
++    p_aimac_desc = phys_to_virt(addr);
++    if (p_aimac_desc == 0)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Changed link descriptor of drp_desc.bin */
++    if (0 != (proc[DRPAI_INDEX_AIMAC_DESC].size & 0x0F))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    iowrite8(0x08, p_aimac_desc + proc[DRPAI_INDEX_AIMAC_DESC].size - 13);
++    __flush_dcache_area(p_aimac_desc + proc[DRPAI_INDEX_AIMAC_DESC].size - 13, 1);
++
++    spin_lock_irqsave(&priv->lock, flags);
++    /* Init drpai_status.err */
++    priv->drpai_status.err    = DRPAI_ERRINFO_SUCCESS;
++    /* IDLE -> RUN */
++    priv->drpai_status.status = DRPAI_STATUS_RUN;
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:%d\n", __func__, current->pid, priv->drpai_status.status);
++
++    /* Kick */
++    (void)R_DRPAI_DRP_Start(0, proc[DRPAI_INDEX_DRP_DESC].address);
++    (void)R_DRPAI_AIMAC_Start(0, proc[DRPAI_INDEX_AIMAC_DESC].address);
++
++    goto end;
++end:
++    if(-ETIMEDOUT != result)
++    {
++        up(&priv->sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_reset(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    struct drpai_priv *priv = drpai_priv;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    unsigned long flags;
++
++    if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT))) 
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status1:   %d\n", __func__, current->pid, priv->drpai_status.status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    if(R_DRPAI_SUCCESS != drpai_reset_device(0))
++    {
++        result = -EIO;
++        goto end;
++    }
++    drpai_init_device(0);
++
++    /* Update internal state */
++    spin_lock_irqsave(&priv->lock, flags);
++    priv->drpai_status.err    = DRPAI_ERRINFO_RESET;
++    priv->drpai_status.status = DRPAI_STATUS_IDLE;
++
++    /* Wake up the process */
++    wake_up_interruptible( &drpai_waitq );
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status2:   %d\n", __func__, current->pid, priv->drpai_status.status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    result = 0;
++    goto end;
++end:
++    if(-ETIMEDOUT != result)
++    {
++        up(&priv->sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_get_status(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    drpai_status_t local_drpai_status;
++    struct drpai_priv *priv = drpai_priv;
++    unsigned long flags;
++
++    if(unlikely(down_timeout(&priv->sem, MAX_SEM_TIMEOUT))) 
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    /* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Get the internal state of DRP-AI */
++    spin_lock_irqsave(&priv->lock, flags);
++    (void)R_DRPAI_Status(0, &priv->drpai_status);
++
++    /* Copy arguments from kernel space to user space */
++    local_drpai_status = priv->drpai_status;
++    spin_unlock_irqrestore(&priv->lock, flags);
++    if (copy_to_user((void __user *)arg, &local_drpai_status, sizeof(drpai_status_t)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++
++    /* Check status */
++    if (DRPAI_STATUS_RUN == local_drpai_status.status)
++    {
++        result = -EBUSY;
++        goto end;
++    }
++
++    /* Check DRP-AI H/W error */
++    if ((DRPAI_ERRINFO_DRP_ERR == local_drpai_status.err) || (DRPAI_ERRINFO_AIMAC_ERR == local_drpai_status.err))
++    {
++        result = -EIO;
++        goto end;
++    }
++
++    goto end;
++end:
++    if(-ETIMEDOUT != result)
++    {
++        up(&priv->sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_reg_dump(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++
++    if(unlikely(down_timeout(&rw_sem, MAX_SEM_TIMEOUT)))
++    {
++        result = -ETIMEDOUT;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) \n", __func__, current->pid);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check of writing and reading completion of DRP-AI obj file */
++    if (DRPAI_STATUS_IDLE_RW != drpai_rw_status->rw_status)
++    {
++        result = -EACCES;
++        goto end;
++    }
++
++    /* Initialization of register dump processing variables */
++    drpai_rw_status->rw_status              = DRPAI_STATUS_DUMP_REG;
++    drpai_rw_status->read_count             = 0;
++    drpai_rw_status->drp_reg_offset_count   = 0;
++    drpai_rw_status->aimac_reg_offset_count = 0;
++
++    goto end;
++end:
++    if(-ETIMEDOUT != result)
++    {
++        up(&rw_sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_assign_param(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    drpai_assign_param_t drpai_assign_param_buf;
++    struct drpai_priv *priv = drpai_priv;
++    char *vbuf;
++    uint64_t addr, size;
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++	/* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    /* Check status */
++    if (DRPAI_STATUS_IDLE_RW != drpai_rw_status->rw_status)
++    {
++        result = -EACCES;
++        goto end;
++    }
++    if(drpai_rw_status->param_info)
++    {
++        result = -EFAULT;
++        goto end;
++    }
++
++    /* Copy arguments from user space to kernel space */
++    if (copy_from_user(&drpai_assign_param_buf, (void __user *)arg, sizeof(drpai_assign_param_t)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 == drpai_assign_param_buf.obj.size)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    addr = priv->bank | (uint64_t)drpai_assign_param_buf.obj.address;
++    size = (uint64_t)drpai_assign_param_buf.obj.size;
++    if ((drpai_region_base_addr > addr) || 
++        ((drpai_region_base_addr + drpai_region_size) <= (addr + size)))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    
++    /* Allocate memory for *_param_info.txt */
++    vbuf = vmalloc(drpai_assign_param_buf.info_size);
++    if(!vbuf){
++        result = -EFAULT;
++        goto end;
++    }
++
++    /* Initialization of read / write processing variables */
++    drpai_rw_status->rw_status    = DRPAI_STATUS_ASSIGN_PARAM;
++    drpai_rw_status->write_count  = 0;
++    drpai_rw_status->assign_param = drpai_assign_param_buf;
++    drpai_rw_status->param_info   = vbuf;
++
++end:
++    if(-ERESTART != result)
++    {
++        up(&rw_sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++/* Note: This function change line variable. so if you use, check your variables address */
++static int8_t get_param_attr(char *line, char *attr, unsigned long *rvalue)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int8_t result = 0;
++    char *ptr_stmp, *ptr_etmp;
++
++    ptr_stmp = strstr(line, attr);
++    ptr_stmp += strlen(attr);
++    ptr_etmp = strstr(line, ",");
++    *ptr_etmp = '\0';
++    if(0 != kstrtoul(ptr_stmp, 10, rvalue))
++    {
++        result = -1;
++        goto end;
++    }
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++    return result;
++}
++static int8_t drpai_get_sys_bank(uint64_t *bank)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int8_t result = 0;
++    void __iomem *base = NULL;
++    uint32_t reg_val;
++
++    base = ioremap_nocache(SYS_BASE, SYS_SIZE);
++    if (!base) {
++        result = -1;
++        goto end;
++    }
++    reg_val = ioread32(base + SYS_DRP_BANK);
++    *bank = ((uint64_t)reg_val & SYS_MASK_DRP) << SYS_SHIFT;
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) SYS_DRP_BANK = 0x%08X\n", __func__, current->pid, reg_val);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) bank = 0x%016llX\n", __func__, current->pid, *bank);
++    goto end;
++end:
++    if(base)
++    {
++        iounmap(base);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++    return result;
++}
++static int8_t drp_param_change16(uint64_t base, uint64_t offset, uint16_t value)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++    int8_t result = 0;
++    volatile void *virt_addr = 0;
++    virt_addr = phys_to_virt(base + offset);
++    if (0 == virt_addr)
++    {
++        result = -1;
++        goto end;
++    }
++    iowrite16(value, virt_addr);
++    __flush_dcache_area(virt_addr, sizeof(value));
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++static int8_t drp_param_change32(uint64_t base, uint64_t offset, uint32_t value)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int8_t result = 0;
++    volatile void *virt_addr = 0;
++    virt_addr = phys_to_virt(base + offset);
++    if (0 == virt_addr)
++    {
++        result = -1;
++        goto end;
++    }
++    iowrite32(value, virt_addr);
++    __flush_dcache_area(virt_addr, sizeof(value));
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++static int8_t drpai_flush_dcache_input_area(uint64_t addr, uint64_t size)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    int8_t result = 0;
++    uint64_t flush_addr, flush_size;
++    uint64_t input_saddr, input_eaddr, linux_mem_saddr, linux_mem_eaddr;
++    volatile void *p_input = 0;
++
++    input_saddr      = addr;
++    input_eaddr      = addr + size - 1;
++    linux_mem_saddr  = drpai_linux_mem_start;
++    linux_mem_eaddr  = drpai_linux_mem_start + drpai_linux_mem_size - 1;
++    if ((input_saddr >= linux_mem_saddr) && 
++        (input_eaddr <= linux_mem_eaddr))
++    {
++        flush_addr = addr;
++        flush_size = size;
++    }
++    else if ((input_saddr >= linux_mem_saddr) &&
++             (input_saddr <= linux_mem_eaddr) &&
++             (input_eaddr >  linux_mem_eaddr))
++    {
++        flush_addr = addr;
++        flush_size = (drpai_linux_mem_start + drpai_linux_mem_size) - addr;
++    }
++    else if((input_eaddr >= linux_mem_saddr) &&
++            (input_eaddr <= linux_mem_eaddr) &&
++            (input_saddr <  linux_mem_saddr))
++    {
++        flush_addr = drpai_linux_mem_start;
++        flush_size = (addr + size) - drpai_linux_mem_start;
++    }
++    else
++    {
++        flush_addr = 0;
++        flush_size = 0;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) flush_addr = 0x%016llX, flush_size = 0x%08X\n", __func__, current->pid, flush_addr, flush_size);
++    if (0 != flush_size)
++    {
++        /* Input data area cache flush */
++        p_input = phys_to_virt(flush_addr);
++        if (0 == p_input)
++        {
++            result = -1;
++            goto end;
++        }
++        __flush_dcache_area(p_input, flush_size);
++    }
++end:
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++
++static long drpai_ioctl_prepost_crop(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    struct drpai_priv *priv = drpai_priv;
++    unsigned long flags;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    drpai_crop_t crop_param_buf;
++    char buf[DRP_PARAM_MAX_LINE_LENGTH];
++    char *ptr, *prev_ptr;
++    unsigned long offset_add0, offset_add1;
++    int mode = 0;
++    uint64_t addr;
++
++    /* Check the internal state of DRP-AI */
++    spin_lock_irqsave(&priv->lock, flags);
++    if(DRPAI_STATUS_RUN == priv->drpai_status.status)
++    {
++        spin_unlock_irqrestore(&priv->lock, flags);
++        result = -EBUSY;
++        goto end;
++    }
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    if((NULL == drpai_rw_status->param_info) ||
++       (DRPAI_STATUS_ASSIGN_PARAM == drpai_rw_status->rw_status) ||
++       (DRPAI_STATUS_WRITE_PARAM  == drpai_rw_status->rw_status))
++    {
++        result = -EACCES;
++        goto end;
++    }
++    /* Copy arguments from user space to kernel space */
++    if (copy_from_user(&crop_param_buf, (void __user *)arg, sizeof(drpai_crop_t)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Check if there is in drpai dedicated area */
++    if((drpai_rw_status->assign_param.obj.address != crop_param_buf.obj.address) ||
++       (drpai_rw_status->assign_param.obj.size != crop_param_buf.obj.size))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Search argument */
++    ptr = drpai_rw_status->param_info;
++    do
++    {
++        /* Save current pointer */
++        prev_ptr = ptr;
++
++        /* Get 1 line */
++        ptr = strchr(ptr, '\n');
++        if(NULL == ptr) {
++            result = -EFAULT;
++            goto end;
++        }
++        ptr += 1;
++        if(ptr - prev_ptr >= DRP_PARAM_MAX_LINE_LENGTH)
++        {
++            result = -EFAULT;
++            goto end;
++        }
++
++        /* Copy only 1line to buffer */
++        memset(buf, 0, sizeof(buf));
++        strncpy(buf, prev_ptr, ptr - prev_ptr);
++
++        if(0 == mode)
++        {
++            /* Check if there is DRP_LIB_NAME_CROP in this line */
++            if(NULL != strstr(buf, DRP_LIB_NAME_CROP))
++            {
++                mode += 1;
++                if(0 != get_param_attr(buf, DRP_PARAM_ATTR_OFFSET_ADD, &offset_add0))
++                {
++                    result = -EFAULT;
++                    goto end;
++                }
++            }
++        }
++        else if(1 == mode)
++        {
++            if(NULL != strstr(buf, DRP_PARAM_ATTR_OFFSET_ADD))
++            {
++                mode += 1;
++                if(0 != get_param_attr(buf, DRP_PARAM_ATTR_OFFSET_ADD, &offset_add1))
++                {
++                    result = -EFAULT;
++                    goto end;
++                }
++                break;
++            }
++        }
++    } while (ptr);
++
++    DRPAI_DEBUG_PRINT("[%s](pid %d) offset_add0=%d, offset_add1=%d\n", __func__, current->pid, offset_add0, offset_add1);
++
++    /* Change parameters of drp_param.bin to value specified by user app. */
++    addr = priv->bank | (uint64_t)crop_param_buf.obj.address;
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add0 + DRP_PARAM_IMG_OWIDTH, crop_param_buf.img_owidth))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add0 + DRP_PARAM_IMG_OHEIGHT, crop_param_buf.img_oheight))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add0 + DRP_PARAM_CROP_POS_X, crop_param_buf.pos_x))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add0 + DRP_PARAM_CROP_POS_Y, crop_param_buf.pos_y))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add1 + DRP_PARAM_IMG_IWIDTH, crop_param_buf.img_owidth))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    if(0 != drp_param_change16(addr, (uint64_t)offset_add1 + DRP_PARAM_IMG_IHEIGHT, crop_param_buf.img_oheight))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++
++    goto end;
++end:
++    if((-EBUSY != result) || (-ERESTART != result))
++    {
++        up(&rw_sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++static long drpai_ioctl_prepost_inaddr(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) start.\n", __func__, current->pid);
++
++    long result = 0;
++    struct drpai_priv *priv = drpai_priv;
++    struct drpai_rw_status *drpai_rw_status = filp->private_data;
++    drpai_inout_t inout_param_buf;
++    char buf[DRP_PARAM_MAX_LINE_LENGTH];
++    char *ptr, *prev_ptr;
++    unsigned long flags;
++    unsigned long offset_add;
++    uint64_t addr, size;
++
++    /* Check the internal state of DRP-AI */
++    spin_lock_irqsave(&priv->lock, flags);
++    if(DRPAI_STATUS_RUN == priv->drpai_status.status)
++    {
++        spin_unlock_irqrestore(&priv->lock, flags);
++        result = -EBUSY;
++        goto end;
++    }
++    spin_unlock_irqrestore(&priv->lock, flags);
++
++    if(unlikely(down_trylock(&rw_sem)))
++    {
++        result = -ERESTART;
++        goto end;
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw1:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++
++    /* Check NULL */
++    if (NULL == arg)
++    {
++        result = -EINVAL;
++        goto end;
++    }
++    if((NULL == drpai_rw_status->param_info) ||
++       (DRPAI_STATUS_ASSIGN_PARAM == drpai_rw_status->rw_status) ||
++       (DRPAI_STATUS_WRITE_PARAM  == drpai_rw_status->rw_status))
++    {
++        result = -EACCES;
++        goto end;
++    }
++    /* Copy arguments from user space to kernel space */
++    if (copy_from_user(&inout_param_buf, (void __user *)arg, sizeof(drpai_inout_t)))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Check if there is in drpai dedicated area */
++    if((drpai_rw_status->assign_param.obj.address != inout_param_buf.obj.address) ||
++       (drpai_rw_status->assign_param.obj.size != inout_param_buf.obj.size))
++    {
++        result = -EINVAL;
++        goto end;
++    }
++
++    /* Search argument */
++    ptr = drpai_rw_status->param_info;
++    do
++    {
++        /* Save current pointer */
++        prev_ptr = ptr;
++
++        /* Get 1 line */
++        ptr = strchr(ptr, '\n');
++        if(NULL == ptr) {
++            result = -EFAULT;
++            goto end;
++        }
++        ptr += 1;
++        if(ptr - prev_ptr >= DRP_PARAM_MAX_LINE_LENGTH)
++        {
++            result = -EFAULT;
++            goto end;
++        }
++
++        /* Copy only 1line to buffer */
++        memset(buf, 0, sizeof(buf));
++        strncpy(buf, prev_ptr, ptr - prev_ptr);
++
++        /* Check if there is DRP_PARAM_ATTR_PROP_INPUT in this line */
++        if(NULL != strstr(buf, DRP_PARAM_ATTR_PROP_INPUT))
++        {
++            if(NULL != strstr(buf, inout_param_buf.name))
++            {
++                if(0 != get_param_attr(buf, DRP_PARAM_ATTR_OFFSET_ADD, &offset_add))
++                {
++                    result = -EFAULT;
++                    goto end;
++                }
++                break;
++            }
++        }
++    } while (ptr);
++
++    DRPAI_DEBUG_PRINT("[%s](pid %d) offset_add=%d\n", __func__, current->pid, offset_add);
++
++    /* Check if input is in linux memory region */
++    addr = priv->bank | (uint64_t)inout_param_buf.data.address;
++    size = (uint64_t)inout_param_buf.data.size;
++    if(0 != drpai_flush_dcache_input_area(addr, size))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    /* Change parameters of drp_param.bin to value specified by user app. */
++    addr = priv->bank | (uint64_t)inout_param_buf.obj.address;
++    if(0 != drp_param_change32(addr, (uint64_t)offset_add + DRP_PARAM_raddr, inout_param_buf.data.address))
++    {
++        result = -EFAULT;
++        goto end;
++    }
++    atomic_set(&drpai_rw_status->inout_flag, 1);
++
++    goto end;
++end:
++    if((-EBUSY != result) || (-ERESTART != result))
++    {
++        up(&rw_sem);
++    }
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) status_rw2:%d\n", __func__, current->pid, drpai_rw_status->rw_status);
++    DRPAI_DEBUG_PRINT(KERN_INFO "[%s](pid %d) end.\n", __func__, current->pid);
++
++    return result;
++}
++module_platform_driver(drpai_platform_driver);
++MODULE_DEVICE_TABLE(of, drpai_match);
++MODULE_DESCRIPTION("RZ/V2M DRP-AI driver");
++MODULE_AUTHOR("Renesas Electronics Corporation");
++MODULE_LICENSE("GPL v2");
++
+diff --git b/drivers/drpai/drpai-reg.h b/drivers/drpai/drpai-reg.h
+new file mode 100755
+index 0000000..707850c
+--- /dev/null
++++ b/drivers/drpai/drpai-reg.h
+@@ -0,0 +1,261 @@
++/*
++ * Driver for the Renesas RZ/V2M DRP-AI unit
++ *
++ * Copyright (C) 2021 Renesas Electronics Corporation
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef R_DRPAI_REG_H
++#define R_DRPAI_REG_H
++
++/*--------------------------------------------------------------------------------------------------
++  DRP Initialization register
++--------------------------------------------------------------------------------------------------*/
++/* Clock */
++#define STPC_CLKGEN_CTRL                (0x81D930)
++#define STPC_CLKGEN_RST                 (0x81D840)
++#define STPC_CLKGEN_STBYWAIT            (0x81D860)
++#define STPC_CLKGEN_DIV                 (0x81D848)
++#define STPC_CLKE                       (0x81D810)
++/* Soft reset */
++#define STPC_SFTRST                     (0x81D800)
++/* DMAC */
++#define IDIF_DMACTLCW                   (0x819900)
++#define IDIF_DMACTLI0                   (0x819100)
++#define IDIF_DMACTLI1                   (0x819200)
++#define IDIF_DMACTLI2                   (0x819300)
++#define IDIF_DMACTLI3                   (0x819400)
++#define ODIF_DMACTLO0                   (0x81A100)
++#define ODIF_DMACTLO1                   (0x81A200)
++#define ODIF_DMACTLO2                   (0x81A300)
++#define ODIF_DMACTLO3                   (0x81A400)
++#define ODIF_DMACTLCR                   (0x81A900)
++/* Err Interrupt mask */
++#define IDIF_EINTMSK                    (0x81900C)
++#define IDIF_EINTMSK_DSC                (0x819014)
++#define ODIF_EINTMSK                    (0x81A00C)
++#define IDMAC_INTME                     (0x81B024)
++#define ODMAC_INTME                     (0x81C024)
++#define RAC_EINTM                       (0x81D008)
++/*--------------------------------------------------------------------------------------------------
++  DRP boot sequence register
++--------------------------------------------------------------------------------------------------*/
++#define DSCC_DPA                        (0x818108)
++#define DSCC_DCTL                       (0x818100)
++/*--------------------------------------------------------------------------------------------------
++  DRP ERRINT register
++--------------------------------------------------------------------------------------------------*/
++#define STPC_ERRINT_STS                 (0x81D808)
++#define DRP_ERRINTSTATUS                (0x3B0048)
++#define IDIF_EINT                       (0x819008)
++#define IDIF_EINT_DSC                   (0x819010)
++#define ODIF_EINT                       (0x81A008)
++#define IDMAC_INTSE                     (0x81B020)
++#define ODMAC_INTSE                     (0x81C020)
++#define RAC_EINTS                       (0x81D004)
++/*--------------------------------------------------------------------------------------------------
++  AI-MAC Initialization register
++--------------------------------------------------------------------------------------------------*/
++/* Clock */
++#define EXD0_STPC_CLKGEN_CTRL           (0x01D930)
++#define EXD0_STPC_CLKGEN_RST            (0x01D840)
++#define EXD0_STPC_CLKGEN_STBYWAIT       (0x01D860)
++#define EXD0_STPC_CLKGEN_DIV            (0x01D848)
++#define EXD0_STPC_CLKE                  (0x01D810)
++#define EXD1_STPC_CLKE                  (0x05D810)
++#define CLKRSTCON_CLKE                  (0x141808)
++/* Soft reset */
++#define EXD0_STPC_SFTRST                (0x01D800)
++#define EXD1_STPC_SFTRST                (0x05D800)
++#define CLKRSTCON_SFTRST                (0x141800)
++/* DMAC */
++#define EXD0_IDIF_DMACTLI0              (0x019100)
++#define EXD0_IDIF_DMACTLI1              (0x019200)
++#define EXD0_IDIF_DMACTLI2              (0x019300)
++#define EXD0_IDIF_DMACTLI3              (0x019400)
++#define EXD0_ODIF_DMACTLO0              (0x01A100)
++#define EXD0_ODIF_DMACTLO1              (0x01A200)
++#define EXD0_ODIF_DMACTLO2              (0x01A300)
++#define EXD0_ODIF_DMACTLO3              (0x01A400)
++#define EXD1_IDIF_DMACTLI0              (0x059100)
++#define EXD1_IDIF_DMACTLI1              (0x059200)
++#define EXD1_IDIF_DMACTLI2              (0x059300)
++#define EXD1_IDIF_DMACTLI3              (0x059400)
++#define EXD1_ODIF_DMACTLO0              (0x05A100)
++#define EXD1_ODIF_DMACTLO1              (0x05A200)
++#define EXD1_ODIF_DMACTLO2              (0x05A300)
++#define EXD1_ODIF_DMACTLO3              (0x05A400)
++/* Nml Interrupt mask */
++#define EXD1_ODIF_INTMSK                (0x05A004)
++/* Err Interrupt mask */
++#define AID_IDIF_EINTMSK                (0x11900C)
++#define AID_IDMAC_INTME                 (0x11B024)
++#define AIMRAC_EINTM                    (0x142008)
++#define CMDSEL_ERRMSK                   (0x140104)
++#define PRAM_INTMASK                    (0x200008)
++#define OSEL_DO_MSK0                    (0x180020)
++#define OSEL_DO_MSK1                    (0x180120)
++#define OSEL_DO_MSK2                    (0x180220)
++#define OSEL_DO_MSK3                    (0x180320)
++#define OSEL_DO_MSK4                    (0x180420)
++#define OSEL_DO_MSK5                    (0x180520)
++#define OSEL_DO_MSK6                    (0x180620)
++#define OSEL_DO_MSK7                    (0x180720)
++#define OSEL_DO_MSK8                    (0x180820)
++#define OSEL_DO_EN0                     (0x180010)
++#define OSEL_DO_EN1                     (0x180110)
++#define OSEL_DO_EN2                     (0x180210)
++#define OSEL_DO_EN3                     (0x180310)
++#define OSEL_DO_EN4                     (0x180410)
++#define OSEL_DO_EN5                     (0x180510)
++#define OSEL_DO_EN6                     (0x180610)
++#define OSEL_DO_EN7                     (0x180710)
++#define OSEL_DO_EN8                     (0x180810)
++#define MACTOP_ERR_MSK                  (0x1C000C)
++#define EXD0_IDIF_EINTMSK               (0x01900C)
++#define EXD1_IDIF_EINTMSK               (0x05900C)
++#define EXD0_ODIF_EINTMSK               (0x01A00C)
++#define EXD1_ODIF_EINTMSK               (0x05A00C)
++#define EXD0_IDMAC_INTME                (0x01B024)
++#define EXD1_IDMAC_INTME                (0x05B024)
++#define EXD0_ODMAC_INTME                (0x01C024)
++#define EXD1_ODMAC_INTME                (0x05C024)
++#define EXD0_RAC_EINTM                  (0x01D008)
++#define EXD1_RAC_EINTM                  (0x05D008)
++/*--------------------------------------------------------------------------------------------------
++  AI-MAC boot sequence register
++--------------------------------------------------------------------------------------------------*/
++#define AID_DSCC_DPA                    (0x118108)
++#define AID_DSCC_DCTL                   (0x118100)
++#define AID_IDIF_DMACTLI0               (0x119100)
++/*--------------------------------------------------------------------------------------------------
++  AI-MAC NMLINT register
++--------------------------------------------------------------------------------------------------*/
++#define EXD1_ODIF_INT                   (0x05A000)
++/*--------------------------------------------------------------------------------------------------
++  AI-MAC ERRINT register
++--------------------------------------------------------------------------------------------------*/
++#define INTMON_ERRINT                   (0x141008)
++#define AID_IDIF_EINT                   (0x119008)
++#define AID_IDMAC_INTSE                 (0x11B020)
++#define AIMRAC_EINTS                    (0x142004)
++#define CMDSEL_ERRSTS                   (0x140100)
++#define PRAM_INT                        (0x200000)
++#define OSEL_DO_ESTS0                   (0x180000)
++#define OSEL_DO_ESTS1                   (0x180100)
++#define OSEL_DO_ESTS2                   (0x180200)
++#define OSEL_DO_ESTS3                   (0x180300)
++#define OSEL_DO_ESTS4                   (0x180400)
++#define OSEL_DO_ESTS5                   (0x180500)
++#define OSEL_DO_ESTS6                   (0x180600)
++#define OSEL_DO_ESTS7                   (0x180700)
++#define OSEL_DO_ESTS8                   (0x180800)
++#define OSEL_AF_ESTS0                   (0x180004)
++#define OSEL_AF_ESTS1                   (0x180104)
++#define OSEL_AF_ESTS2                   (0x180204)
++#define OSEL_AF_ESTS3                   (0x180304)
++#define OSEL_AF_ESTS4                   (0x180404)
++#define OSEL_AF_ESTS5                   (0x180504)
++#define OSEL_AF_ESTS6                   (0x180604)
++#define OSEL_AF_ESTS7                   (0x180704)
++#define OSEL_AF_ESTS8                   (0x180804)
++#define OSEL_DO_FESTS0                  (0x181000)
++#define OSEL_DO_FESTS1                  (0x181100)
++#define OSEL_DO_FESTS2                  (0x181200)
++#define OSEL_DO_FESTS3                  (0x181300)
++#define OSEL_DO_FESTS4                  (0x181400)
++#define OSEL_DO_FESTS5                  (0x181500)
++#define OSEL_DO_FESTS6                  (0x181600)
++#define OSEL_DO_FESTS7                  (0x181700)
++#define OSEL_DO_FESTS8                  (0x181800)
++#define OSEL_AF_FESTS0                  (0x181004)
++#define OSEL_AF_FESTS1                  (0x181104)
++#define OSEL_AF_FESTS2                  (0x181204)
++#define OSEL_AF_FESTS3                  (0x181304)
++#define OSEL_AF_FESTS4                  (0x181404)
++#define OSEL_AF_FESTS5                  (0x181504)
++#define OSEL_AF_FESTS6                  (0x181604)
++#define OSEL_AF_FESTS7                  (0x181704)
++#define OSEL_AF_FESTS8                  (0x181804)
++#define MACTOP_ERR_STS                  (0x1C0008)
++#define MACCTL_FERR_STS                 (0x1C0800)
++#define EXD0_IDIF_EINT                  (0x019008)
++#define EXD1_IDIF_EINT                  (0x059008)
++#define EXD0_ODIF_EINT                  (0x01A008)
++#define EXD1_ODIF_EINT                  (0x05A008)
++#define EXD0_IDMAC_INTSE                (0x01B020)
++#define EXD1_IDMAC_INTSE                (0x05B020)
++#define EXD0_ODMAC_INTSE                (0x01C020)
++#define EXD1_ODMAC_INTSE                (0x05C020)
++#define EXD0_RAC_EINTS                  (0x01D004)
++#define EXD1_RAC_EINTS                  (0x05D004)
++/*--------------------------------------------------------------------------------------------------
++  AI-MAC Reset register
++--------------------------------------------------------------------------------------------------*/
++#define SYNCTBL_TBL0                    (0x140800)
++#define SYNCTBL_TBL1                    (0x140804)
++#define SYNCTBL_TBL2                    (0x140808)
++#define SYNCTBL_TBL3                    (0x14080C)
++#define SYNCTBL_TBL4                    (0x140810)
++#define SYNCTBL_TBL5                    (0x140814)
++#define SYNCTBL_TBL6                    (0x140818)
++#define SYNCTBL_TBL7                    (0x14081C)
++#define SYNCTBL_TBL8                    (0x140820)
++#define SYNCTBL_TBL9                    (0x140824)
++#define SYNCTBL_TBL10                   (0x140828)
++#define SYNCTBL_TBL11                   (0x14082C)
++#define SYNCTBL_TBL12                   (0x140830)
++#define SYNCTBL_TBL13                   (0x140834)
++#define SYNCTBL_TBL14                   (0x140838)
++#define SYNCTBL_TBL15                   (0x14083C)
++/*--------------------------------------------------------------------------------------------------
++  DRP-AI Internal state register
++--------------------------------------------------------------------------------------------------*/
++#define DSCC_PAMON                      (0x818118)
++#define AID_DSCC_PAMON                  (0x118118)
++/*--------------------------------------------------------------------------------------------------
++  Bit manipulation
++--------------------------------------------------------------------------------------------------*/
++#define DRPAI_BIT0                      (0x00000001u)
++#define DRPAI_BIT1                      (0x00000002u)
++#define DRPAI_BIT2                      (0x00000004u)
++#define DRPAI_BIT3                      (0x00000008u)
++#define DRPAI_BIT4                      (0x00000010u)
++#define DRPAI_BIT5                      (0x00000020u)
++#define DRPAI_BIT6                      (0x00000040u)
++#define DRPAI_BIT7                      (0x00000080u)
++#define DRPAI_BIT8                      (0x00000100u)
++#define DRPAI_BIT9                      (0x00000200u)
++#define DRPAI_BIT10                     (0x00000400u)
++#define DRPAI_BIT11                     (0x00000800u)
++#define DRPAI_BIT12                     (0x00001000u)
++#define DRPAI_BIT13                     (0x00002000u)
++#define DRPAI_BIT14                     (0x00004000u)
++#define DRPAI_BIT15                     (0x00008000u)
++#define DRPAI_BIT16                     (0x00010000u)
++#define DRPAI_BIT17                     (0x00020000u)
++#define DRPAI_BIT18                     (0x00040000u)
++#define DRPAI_BIT19                     (0x00080000u)
++#define DRPAI_BIT20                     (0x00100000u)
++#define DRPAI_BIT21                     (0x00200000u)
++#define DRPAI_BIT22                     (0x00400000u)
++#define DRPAI_BIT23                     (0x00800000u)
++#define DRPAI_BIT24                     (0x01000000u)
++#define DRPAI_BIT25                     (0x02000000u)
++#define DRPAI_BIT26                     (0x04000000u)
++#define DRPAI_BIT27                     (0x08000000u)
++#define DRPAI_BIT28                     (0x10000000u)
++#define DRPAI_BIT29                     (0x20000000u)
++#define DRPAI_BIT30                     (0x40000000u)
++#define DRPAI_BIT31                     (0x80000000u)
++
++#endif /* R_DRPAI_REG_H */

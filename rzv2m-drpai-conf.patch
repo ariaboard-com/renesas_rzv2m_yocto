@@ -1,0 +1,19 @@
+diff --git a/build/conf/bblayers.conf b/build/conf/bblayers.conf
+index 7feb930..3633e89 100755
+--- a/build/conf/bblayers.conf
++++ b/build/conf/bblayers.conf
+@@ -21,4 +21,5 @@ BBLAYERS ?= " \
+   ${@'${TOPDIR}/../meta-openembedded/meta-networking' if '${VIRTUALIZATION_CHECK}' == 'True' else ''} \
+   ${@'${TOPDIR}/../meta-openembedded/meta-python' if '${VIRTUALIZATION_CHECK}' == 'True' else ''} \
+   ${@'${TOPDIR}/../meta-virtualization' if '${VIRTUALIZATION_CHECK}' == 'True' else ''} \
++  ${TOPDIR}/../meta-drpai \
+   "
+diff --git a/build/conf/local.conf b/build/conf/local.conf
+index 837dbab..0ecfd2f 100755
+--- a/build/conf/local.conf
++++ b/build/conf/local.conf
+@@ -368,3 +368,4 @@ BB_NO_NETWORK = "0"
+ 
+ TOOLCHAIN_TARGET_TASK_append = " kernel-devsrc"
+ 
++IMAGE_INSTALL_append =" ai-eva-sw "

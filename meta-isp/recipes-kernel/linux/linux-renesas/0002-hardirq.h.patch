@@ -1,0 +1,15 @@
+--- ./arch/arm64/include/asm/hardirq.h.org	2020-11-26 22:03:23.091916690 +0900
++++ ./arch/arm64/include/asm/hardirq.h	2020-11-26 22:03:55.786566080 +0900
+@@ -25,10 +25,11 @@
+ #include <asm/sysreg.h>
+ 
+ #define NR_IPI	7
++#define MAX_IPI	16
+ 
+ typedef struct {
+ 	unsigned int __softirq_pending;
+-	unsigned int ipi_irqs[NR_IPI];
++	unsigned int ipi_irqs[MAX_IPI];
+ } ____cacheline_aligned irq_cpustat_t;
+ 
+ #include <linux/irq_cpustat.h>	/* Standard mappings for irq_cpustat_t above */
